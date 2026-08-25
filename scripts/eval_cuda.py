@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
@@ -18,9 +19,33 @@ FIBQUANT_K = 4  # coordinates per codebook block
 FIBQUANT_D = 256  # per-head key/value dim
 N_LEVELS = 1 << (BITS * FIBQUANT_K)  # codebook size implied by (BITS, K)
 
+# --- environment layout --------------------------------------------------
+# A Databricks notebook's CWD is not the repo root, so relative paths like
+# models/... don't resolve. Set REPO_ROOT to wherever the repo (fibquant/,
+# models/) lives in the workspace, e.g.
+#   "/Workspace/Repos/<user>/kv_quantize"  (git folder / workspace files)
+#   "/dbfs/FileStore/kv_quantize"          (uploaded to DBFS)
+# None = auto-detect: parent directory of the importable fibquant package.
+REPO_ROOT = None
+
+
+def _resolve_repo_root() -> Path:
+    if REPO_ROOT is not None:
+        return Path(REPO_ROOT).expanduser().resolve()
+    try:
+        import fibquant as _fq
+    except ImportError:
+        return Path.cwd()
+    return Path(_fq.__file__).resolve().parent.parent
+
+
+_REPO_ROOT = _resolve_repo_root()
+sys.path.insert(0, str(_REPO_ROOT))  # keep `import fibquant` working in notebooks
+logging.info("repo root: %s", _REPO_ROOT)
+
 # --- run configuration ---------------------------------------------------
-MODEL_DIR = "models/Qwen3.5-0.8B"
-SPEC_PATH = f"models/fibquant/fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt"
+MODEL_DIR = str(_REPO_ROOT / "models" / "Qwen3.5-0.8B")
+SPEC_PATH = str(_REPO_ROOT / "models" / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt")
 ENABLE_FIBQUANT = True
 TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"
 OUTPUT_DIR = "results/qwen3.5-0.8b"
@@ -73,8 +98,19 @@ def _patch_generation(penalty: float, spec) -> None:
 
 
 def main() -> None:
+    if not Path(MODEL_DIR).exists():
+        raise FileNotFoundError(
+            f"model directory not found: {MODEL_DIR} -- set REPO_ROOT at the top of this script"
+        )
+
     spec = None
     if ENABLE_FIBQUANT:
+        if not Path(SPEC_PATH).exists():
+            raise FileNotFoundError(
+                f"FibQuant codebook not found: {SPEC_PATH} -- build it with "
+                f"scripts/build_codebook.py and upload it, or set REPO_ROOT / SPEC_PATH "
+                f"at the top of this script"
+            )
         from fibquant import FibQuantSpec, enable_fibquant, load_spec
 
         spec = FibQuantSpec.from_checkpoint(load_spec(SPEC_PATH))
