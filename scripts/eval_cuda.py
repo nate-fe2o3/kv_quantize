@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -94,6 +95,14 @@ APPLY_CHAT_TEMPLATE = False
 CACHE_REQUESTS = False  # cache lm-eval requests to disk (retry-safe)
 SYSTEM_INSTRUCTION = None  # system message for chat template
 GEN_KWARGS = None  # e.g. {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "presence_penalty": 0.5}
+
+# Cache HF datasets under a UC volume so downloads survive serverless restarts
+# (the default /tmp cache is ephemeral), e.g.
+#   "/Volumes/<catalog>/<schema>/<volume>/hf_cache"
+DATASETS_CACHE_DIR = None
+
+if DATASETS_CACHE_DIR:
+    os.environ.setdefault("HF_DATASETS_CACHE", DATASETS_CACHE_DIR)
 
 
 def _patch_generation(penalty: float, spec) -> None:
