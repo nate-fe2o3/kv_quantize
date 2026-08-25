@@ -2,6 +2,14 @@
 
 NVIDIA GPU variant (Databricks notebook): runs on CUDA. Configure via the
 constants below and execute the file/cell directly -- no CLI arguments.
+
+Databricks (serverless) setup:
+1. Attach the custom environment: notebook Environment side pane >
+   Base environment > Custom > select env.yaml from this repo (pins
+   transformers 5.15.1 / lm-eval 0.4.12 / accelerate 1.14.0 on Python 3.12).
+2. Run on Serverless GPU compute (AI Runtime).
+3. Set REPO_ROOT below to this repo's workspace path and MODELS_DIR to the
+   volume holding the checkpoints, then execute.
 """
 
 from __future__ import annotations
@@ -13,6 +21,28 @@ from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 
+import transformers
+
+try:
+    import transformers.models.qwen3_5  # noqa: F401
+except ModuleNotFoundError:
+    raise RuntimeError(
+        f"transformers {transformers.__version__} lacks Qwen3.5 support (need 5.15.1). "
+        "Attach the custom environment from env.yaml via the notebook Environment "
+        "side pane (Base environment > Custom), then re-run."
+    ) from None
+
+import typing_extensions
+
+try:
+    typing_extensions.TypedDict("_Probe", {"x": int}, extra_items=int)
+except TypeError:
+    raise RuntimeError(
+        f"typing_extensions at {typing_extensions.__file__} is too old for lm-eval "
+        "0.4.12 (PEP 728 extra_items). Attach the custom environment from env.yaml, "
+        "or on a classic cluster run in a cell above: %pip install -U typing_extensions"
+    ) from None
+
 # --- quantization width --------------------------------------------------
 BITS = 2  # FibQuant bits/coordinate (codebook checkpoint must exist for this)
 FIBQUANT_K = 4  # coordinates per codebook block
@@ -21,12 +51,17 @@ N_LEVELS = 1 << (BITS * FIBQUANT_K)  # codebook size implied by (BITS, K)
 
 # --- environment layout --------------------------------------------------
 # A Databricks notebook's CWD is not the repo root, so relative paths like
-# models/... don't resolve. Set REPO_ROOT to wherever the repo (fibquant/,
-# models/) lives in the workspace, e.g.
-#   "/Workspace/Repos/<user>/kv_quantize"  (git folder / workspace files)
-#   "/dbfs/FileStore/kv_quantize"          (uploaded to DBFS)
-# None = auto-detect: parent directory of the importable fibquant package.
+# models/... don't resolve. Set REPO_ROOT to wherever the repo code lives,
+# e.g. "/Workspace/Users/<user>/kv_quantize". Required on serverless (fibquant
+# is never on sys.path there). None = auto-detect: parent directory of the
+# importable fibquant package (works locally and on classic clusters).
 REPO_ROOT = None
+
+# Checkpoints (models/) are gitignored, so a Databricks git folder never
+# contains them. Upload models/ to DBFS or a UC volume and point MODELS_DIR
+# at it, e.g. "/dbfs/FileStore/kv_quantize/models" or
+# "/Volumes/<catalog>/<schema>/<volume>/models". None = <repo>/models.
+MODELS_DIR = None
 
 
 def _resolve_repo_root() -> Path:
@@ -43,9 +78,11 @@ _REPO_ROOT = _resolve_repo_root()
 sys.path.insert(0, str(_REPO_ROOT))  # keep `import fibquant` working in notebooks
 logging.info("repo root: %s", _REPO_ROOT)
 
+_MODELS_DIR = Path(MODELS_DIR).expanduser() if MODELS_DIR else _REPO_ROOT / "models"
+
 # --- run configuration ---------------------------------------------------
-MODEL_DIR = str(_REPO_ROOT / "models" / "Qwen3.5-0.8B")
-SPEC_PATH = str(_REPO_ROOT / "models" / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt")
+MODEL_DIR = str(_MODELS_DIR / "Qwen3.5-0.8B")
+SPEC_PATH = str(_MODELS_DIR / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt")
 ENABLE_FIBQUANT = True
 TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"
 OUTPUT_DIR = "results/qwen3.5-0.8b"
@@ -99,17 +136,19 @@ def _patch_generation(penalty: float, spec) -> None:
 
 def main() -> None:
     if not Path(MODEL_DIR).exists():
-        raise FileNotFoundError(
-            f"model directory not found: {MODEL_DIR} -- set REPO_ROOT at the top of this script"
+        logging.warning(
+            "model directory not found: %s -- upload models/ to DBFS/UC volume and set "
+            "MODELS_DIR at the top of this script (or set MODEL_DIR to a HF hub repo id)",
+            MODEL_DIR,
         )
 
     spec = None
     if ENABLE_FIBQUANT:
         if not Path(SPEC_PATH).exists():
             raise FileNotFoundError(
-                f"FibQuant codebook not found: {SPEC_PATH} -- build it with "
-                f"scripts/build_codebook.py and upload it, or set REPO_ROOT / SPEC_PATH "
-                f"at the top of this script"
+                f"FibQuant codebook not found: {SPEC_PATH} -- models/ is gitignored, so "
+                f"upload it alongside the model checkpoints (e.g. DBFS/UC volume) and set "
+                f"MODELS_DIR at the top of this script"
             )
         from fibquant import FibQuantSpec, enable_fibquant, load_spec
 

@@ -712,7 +712,7 @@ requires-dist = [
     { name = "lm-eval", specifier = ">=0.4.12" },
     { name = "nltk", specifier = ">=3.10.3" },
     { name = "scipy", specifier = ">=1.18.0" },
-    { name = "transformers", specifier = ">=4.57" },
+    { name = "transformers", specifier = ">=5.15" },
 ]
 
 [[package]]
