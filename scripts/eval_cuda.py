@@ -1,26 +1,37 @@
 """Run lm-eval on Qwen3.5-0.8B, optionally with FibQuant KV compression.
 
-NVIDIA GPU variant: runs on CUDA instead of MPS.
-
-Usage:
-    # baseline
-    .venv/bin/python scripts/eval_cuda.py --tag baseline --tasks hellaswag,wikitext
-    # fibquant (b=2)
-    .venv/bin/python scripts/eval_cuda.py --tag fibquant-b2 --fibquant --tasks hellaswag,wikitext
-    # quick smoke
-    .venv/bin/python scripts/eval_cuda.py --tag smoke --fibquant --tasks hellaswag --limit 20
+NVIDIA GPU variant (Databricks notebook): runs on CUDA. Configure via the
+constants below and execute the file/cell directly -- no CLI arguments.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 
+# --- quantization width --------------------------------------------------
+BITS = 2  # FibQuant bits/coordinate (codebook checkpoint must exist for this)
+FIBQUANT_K = 4  # coordinates per codebook block
+FIBQUANT_D = 256  # per-head key/value dim
+N_LEVELS = 1 << (BITS * FIBQUANT_K)  # codebook size implied by (BITS, K)
+
+# --- run configuration ---------------------------------------------------
 MODEL_DIR = "models/Qwen3.5-0.8B"
+SPEC_PATH = f"models/fibquant/fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt"
+ENABLE_FIBQUANT = True
+TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"
+OUTPUT_DIR = "results/qwen3.5-0.8b"
+TASKS = ["hellaswag", "wikitext"]
+BATCH_SIZE = 8
+MAX_LENGTH = 2048
+LIMIT = None  # eval limit (testing only)
+APPLY_CHAT_TEMPLATE = False
+CACHE_REQUESTS = False  # cache lm-eval requests to disk (retry-safe)
+SYSTEM_INSTRUCTION = None  # system message for chat template
+GEN_KWARGS = None  # e.g. {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "presence_penalty": 0.5}
 
 
 def _patch_generation(penalty: float, spec) -> None:
@@ -62,57 +73,25 @@ def _patch_generation(penalty: float, spec) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tag", type=str, required=True, help="output subdirectory under results/qwen3.5-0.8b/")
-    parser.add_argument("--tasks", type=str, default="hellaswag,wikitext")
-    parser.add_argument("--limit", type=int, default=None, help="eval limit (testing only)")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--fibquant", action="store_true", help="enable FibQuant b=2 compression")
-    parser.add_argument("--spec", type=str, default="models/fibquant/fibquant_d256_k4_N256.pt")
-    parser.add_argument("--output-dir", type=str, default="results/qwen3.5-0.8b")
-    parser.add_argument("--apply-chat-template", action="store_true", help="wrap docs with the model chat template")
-    parser.add_argument("--cache-requests", action="store_true", help="cache lm-eval requests to disk (retry-safe)")
-    parser.add_argument("--system-instruction", type=str, default=None, help="system message for chat template")
-    parser.add_argument(
-        "--gen-kwargs",
-        type=str,
-        default=None,
-        help="comma-separated k=v overrides for generation kwargs, e.g. do_sample=true,temperature=0.7,top_p=0.8",
-    )
-    args = parser.parse_args()
-
-    if args.fibquant:
+    spec = None
+    if ENABLE_FIBQUANT:
         from fibquant import FibQuantSpec, enable_fibquant, load_spec
 
-        spec = FibQuantSpec.from_checkpoint(load_spec(args.spec))
+        spec = FibQuantSpec.from_checkpoint(load_spec(SPEC_PATH))
         logging.info("enabling FibQuant: d=%d k=%d N=%d b=%.1f bits/coord", spec.d, spec.k, spec.n_levels, spec.bits_per_coord)
         enable_fibquant(None, spec)
 
-    gen_kwargs = None
-    if args.gen_kwargs:
-        gen_kwargs = {}
-        for kv in args.gen_kwargs.split(","):
-            key, value = kv.split("=", 1)
-            lowered = value.lower()
-            if lowered in ("true", "false"):
-                gen_kwargs[key] = lowered == "true"
-            else:
-                try:
-                    gen_kwargs[key] = int(value) if "." not in value else float(value)
-                except ValueError:
-                    gen_kwargs[key] = value
-
+    gen_kwargs = GEN_KWARGS
     if gen_kwargs and "presence_penalty" in gen_kwargs:
         logging.info(
             "presence_penalty=%.1f requested: transformers 5.x removed it from GenerationConfig, "
             "injecting a PresencePenaltyLogitsProcessor via HFLM._model_generate",
             gen_kwargs["presence_penalty"],
         )
-    if gen_kwargs and "presence_penalty" in gen_kwargs or args.fibquant:
+    if (gen_kwargs and "presence_penalty" in gen_kwargs) or ENABLE_FIBQUANT:
         _patch_generation(
             penalty=gen_kwargs.get("presence_penalty", 0.0) if gen_kwargs else 0.0,
-            spec=spec if args.fibquant else None,
+            spec=spec if ENABLE_FIBQUANT else None,
         )
 
     from lm_eval import simple_evaluate
@@ -120,23 +99,23 @@ def main() -> None:
     model_args = {
         "pretrained": MODEL_DIR,
         "dtype": "bfloat16",
-        "max_length": args.max_length,
+        "max_length": MAX_LENGTH,
         "device": "cuda",
     }
     results = simple_evaluate(
         model="hf",
         model_args=model_args,
-        tasks=args.tasks.split(","),
+        tasks=TASKS,
         num_fewshot=None,
-        batch_size=args.batch_size,
-        limit=args.limit,
-        apply_chat_template=args.apply_chat_template,
-        system_instruction=args.system_instruction,
+        batch_size=BATCH_SIZE,
+        limit=LIMIT,
+        apply_chat_template=APPLY_CHAT_TEMPLATE,
+        system_instruction=SYSTEM_INSTRUCTION,
         gen_kwargs=gen_kwargs,
-        cache_requests=args.cache_requests,
+        cache_requests=CACHE_REQUESTS,
     )
 
-    out_dir = Path(args.output_dir) / args.tag
+    out_dir = Path(OUTPUT_DIR) / TAG
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "results.json"
 
@@ -151,5 +130,4 @@ def main() -> None:
     logging.info("results written to %s", path)
 
 
-if __name__ == "__main__":
-    main()
+main()
