@@ -20,7 +20,9 @@ import os
 import sys
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s"
+)
 
 import transformers
 
@@ -83,12 +85,14 @@ _MODELS_DIR = Path(MODELS_DIR).expanduser() if MODELS_DIR else _REPO_ROOT / "mod
 
 # --- run configuration ---------------------------------------------------
 MODEL_DIR = str(_MODELS_DIR / "Qwen3.5-0.8B")
-SPEC_PATH = str(_MODELS_DIR / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt")
+SPEC_PATH = str(
+    _MODELS_DIR / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt"
+)
 ENABLE_FIBQUANT = True
 TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"
 OUTPUT_DIR = "results/qwen3.5-0.8b"
 TASKS = ["hellaswag", "wikitext"]
-BATCH_SIZE = 8
+BATCH_SIZE = "auto"
 MAX_LENGTH = 2048
 LIMIT = None  # eval limit (testing only)
 APPLY_CHAT_TEMPLATE = False
@@ -125,7 +129,9 @@ def _patch_generation(penalty: float, spec) -> None:
             def __init__(self, penalty: float):
                 self.penalty = penalty
 
-            def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+            def __call__(
+                self, input_ids: torch.Tensor, scores: torch.Tensor
+            ) -> torch.Tensor:
                 generated = torch.unique(input_ids)
                 scores[:, generated] = scores[:, generated] - self.penalty
                 return scores
@@ -135,10 +141,16 @@ def _patch_generation(penalty: float, spec) -> None:
     def patched(self, context, max_length, stop, **generation_kwargs):
         generation_kwargs.pop("presence_penalty", None)
         if penalty:
-            generation_kwargs["logits_processor"] = [PresencePenaltyLogitsProcessor(penalty)]
+            generation_kwargs["logits_processor"] = [
+                PresencePenaltyLogitsProcessor(penalty)
+            ]
         if spec is not None:
-            generation_kwargs["past_key_values"] = FibQuantCache(config=self.model.config, spec=spec)
-        return original(self, context, max_length=max_length, stop=stop, **generation_kwargs)
+            generation_kwargs["past_key_values"] = FibQuantCache(
+                config=self.model.config, spec=spec
+            )
+        return original(
+            self, context, max_length=max_length, stop=stop, **generation_kwargs
+        )
 
     hf_mod.HFLM._model_generate = patched
 
@@ -162,7 +174,13 @@ def main() -> None:
         from fibquant import FibQuantSpec, enable_fibquant, load_spec
 
         spec = FibQuantSpec.from_checkpoint(load_spec(SPEC_PATH))
-        logging.info("enabling FibQuant: d=%d k=%d N=%d b=%.1f bits/coord", spec.d, spec.k, spec.n_levels, spec.bits_per_coord)
+        logging.info(
+            "enabling FibQuant: d=%d k=%d N=%d b=%.1f bits/coord",
+            spec.d,
+            spec.k,
+            spec.n_levels,
+            spec.bits_per_coord,
+        )
         enable_fibquant(None, spec)
 
     gen_kwargs = GEN_KWARGS
