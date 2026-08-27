@@ -52,6 +52,11 @@ SPEC_PATHS = [
 ]  # Databricks: ["/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt", "..."]
 
 TRIALS = 10  # trials per depth
+# Trials are batched into generate() calls of this size; peak activation
+# memory scales with batch * seq^2 (attention scores), so 30 x 4096 in one
+# call OOMs. 10 matches the memory of the earlier 10-trial runs; lower to 5
+# if a long depth still OOMs, raise if the GPU has headroom.
+TRIAL_BATCH = 10
 DEPTHS = [256, 512, 1024, 2048, 4096]  # marker-to-query token distances
 MAX_LENGTH = 4096  # cap on total prompt length (filler is truncated)
 MAX_NEW_TOKENS = 12  # generated tokens per trial
@@ -150,18 +155,23 @@ def run_config(
     results: dict[int, float] = {}
     for depth in sorted(inputs_by_depth):
         inputs = inputs_by_depth[depth].to(device)
-        cache = FibQuantCache(config=config_text, spec=spec)
+        hits = 0
+        # A fresh cache per chunk: generate() appends the continuation into the
+        # passed cache, so reusing one cache would feed chunk 2 into chunk 1's
+        # already-built sequence.
         with torch.no_grad():
-            out = model.generate(
-                input_ids=inputs,
-                attention_mask=torch.ones_like(inputs),  # no padding in batch, but silence pad-token warnings
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                past_key_values=cache,
-            )
-        conts = [tokenizer.decode(row[inputs.shape[-1]:]) for row in out]
-        hits = sum(marker.lower() in c.lower() for c in conts)
-        results[depth] = hits / len(conts)
+            for chunk in inputs.split(TRIAL_BATCH, dim=0):
+                cache = FibQuantCache(config=config_text, spec=spec)
+                out = model.generate(
+                    input_ids=chunk,
+                    attention_mask=torch.ones_like(chunk),  # no padding in batch, but silence pad-token warnings
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    past_key_values=cache,
+                )
+                conts = [tokenizer.decode(row[chunk.shape[-1]:]) for row in out]
+                hits += sum(marker.lower() in c.lower() for c in conts)
+        results[depth] = hits / inputs.shape[0]
     return results
 
 
@@ -191,7 +201,7 @@ def main() -> None:
     config_text = model.config.text_config
     max_depth = MAX_LENGTH - 16
     print(f"configs: {', '.join(name for name, _ in specs)}")
-    print(f"trials={TRIALS} depths={DEPTHS} (filler capped at {max_depth} tokens) marker={MARKER!r}")
+    print(f"trials={TRIALS} (batched {TRIAL_BATCH}) depths={DEPTHS} (filler capped at {max_depth} tokens) marker={MARKER!r}")
 
     # Build trial inputs once, reused for every config (same contexts, only cache differs).
     inputs_by_depth: dict[int, torch.Tensor] = {}
