@@ -9,19 +9,14 @@ continuation. Batching by depth keeps it cheap: no thinking traces
 (enable_thinking=False; the default thinking mode is what makes IFEval take
 ~5h on MPS) and short generations.
 
-Usage:
-    # baseline + b=2 codebook
-    .venv/bin/python scripts/key_recall.py --bits 2
-    # baseline + b=2/3/4, custom spec paths and run settings
-    .venv/bin/python scripts/key_recall.py \
-        --spec models/fibquant/fibquant_d256_k4_N4096.pt --bits 4 \
-        --trials 20 --depths 256,512,1024,2048,4096 \
-        --out results/qwen3.5-0.8b/key-recall-b2b3b4.json
+Configure via the constants below and run the file directly — no CLI
+arguments:
+
+    .venv/bin/python scripts/key_recall.py
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import random
 import sys
@@ -29,12 +24,32 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForImageTextToText, AutoTokenizer
+from transformers import AutoTokenizer
 
 # Make the repo root importable even when run as "python scripts/foo.py".
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fibquant import FibQuantCache, FibQuantSpec, default_spec_path, load_spec  # noqa: E402
+from fibquant import FibQuantCache, FibQuantSpec  # noqa: E402
+from fibquant.eval_harness import load_model  # noqa: E402
+
+# --- run configuration ---------------------------------------------------
+MODEL_DIR = "models/Qwen3.5-0.8B"
+DEVICE = "mps"  # "cuda" on Databricks
+
+# Cache configurations to compare, one row each in the output table.
+# INCLUDE_BASELINE adds the fp16 (uncompressed) row; BITS entries resolve via
+# FibQuantSpec.from_bits (d=256, k=4); SPEC_PATHS are explicit checkpoints.
+INCLUDE_BASELINE = True
+BITS = [2, 3]  # e.g. [2], [2, 3, 4], or []
+SPEC_PATHS = []  # e.g. ["models/fibquant/fibquant_d256_k4_N4096.pt"]
+
+TRIALS = 10  # trials per depth
+DEPTHS = [256, 512, 1024, 2048, 4096]  # marker-to-query token distances
+MAX_LENGTH = 4096  # cap on total prompt length (filler is truncated)
+MAX_NEW_TOKENS = 12  # generated tokens per trial
+MARKER = "rabbit"  # recall marker word
+SEED = 0
+OUT = None  # write JSON results here, or None to only print the table
 
 SYSTEM_PROMPT = "You answer in one short phrase, nothing else."
 
@@ -58,10 +73,6 @@ The carpenter built a sturdy chest, fitting each joint with care. Green fields
 stretched to the horizon, dotted with sheep and lone oak trees. The ferry
 crossed the lake every hour, carrying passengers and bicycles. Smoke rose from
 the chimneys of the village, curling into the cold morning air."""
-
-
-def _int_list(value: str) -> list[int]:
-    return [int(v) for v in value.split(",") if v.strip()]
 
 
 def _repeat(seq, n):
@@ -147,61 +158,44 @@ def run_config(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--spec", type=str, default=None, action="append", help="FibQuant spec checkpoint (repeatable)")
-    parser.add_argument("--bits", type=int, default=None, action="append", choices=(2, 3, 4), help="bits/coord; resolves spec via default_spec_path (repeatable)")
-    parser.add_argument("--trials", type=int, default=10, help="trials per depth")
-    parser.add_argument("--depths", type=str, default="256,512,1024,2048,4096", help="comma-separated marker-to-query token distances")
-    parser.add_argument("--max-length", type=int, default=4096, help="cap on total prompt length (filler is truncated)")
-    parser.add_argument("--max-new-tokens", type=int, default=12, help="generated tokens per trial")
-    parser.add_argument("--marker", type=str, default="rabbit", help="recall marker word")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, default="mps")
-    parser.add_argument("--model", type=str, default="models/Qwen3.5-0.8B")
-    parser.add_argument("--out", type=str, default=None, help="write JSON results here")
-    parser.add_argument("--no-baseline", action="store_true", help="skip the fp16 cache row")
-    args = parser.parse_args()
-
     specs: list[tuple[str, FibQuantSpec | None]] = []
-    if not args.no_baseline:
+    if INCLUDE_BASELINE:
         specs.append(("baseline", None))
-    for bits in args.bits or []:
-        p = str(default_spec_path(d=256, k=4, n_levels=1 << (bits * 4)))
-        specs.append((f"fq-b{bits}", FibQuantSpec.from_checkpoint(load_spec(p))))
-    for p in args.spec or []:
-        spec = FibQuantSpec.from_checkpoint(load_spec(p))
+    for bits in BITS:
+        specs.append((f"fq-b{bits}", FibQuantSpec.from_bits(d=256, k=4, bits=bits)))
+    for p in SPEC_PATHS:
+        spec = FibQuantSpec.from_path(p)
         specs.append((f"fq-N{spec.n_levels}", spec))
     if not specs:
-        parser.error("pass --bits, --spec, or remove --no-baseline")
+        raise ValueError("set BITS/SPEC_PATHS or INCLUDE_BASELINE so at least one configuration runs")
 
-    depths = _int_list(args.depths)
-    if not depths:
-        parser.error("--depths must list at least one depth")
+    if not DEPTHS:
+        raise ValueError("DEPTHS must list at least one depth")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.bfloat16).to(args.device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = load_model(MODEL_DIR, DEVICE)
 
-    if len(tokenizer.encode(args.marker)) != 1 or len(tokenizer.encode(f" {args.marker}")) != 1:
-        parser.error(f"--marker {args.marker!r} is not a single token in context; pick another word")
-    if args.marker.lower() in CORPUS.lower():
-        parser.error("--marker must not appear in the filler corpus")
+    if len(tokenizer.encode(MARKER)) != 1 or len(tokenizer.encode(f" {MARKER}")) != 1:
+        raise ValueError(f"MARKER {MARKER!r} is not a single token in context; pick another word")
+    if MARKER.lower() in CORPUS.lower():
+        raise ValueError("MARKER must not appear in the filler corpus")
 
     config_text = model.config.text_config
-    max_depth = args.max_length - 16
+    max_depth = MAX_LENGTH - 16
     print(f"configs: {', '.join(name for name, _ in specs)}")
-    print(f"trials={args.trials} depths={depths} (filler capped at {max_depth} tokens) marker={args.marker!r}")
+    print(f"trials={TRIALS} depths={DEPTHS} (filler capped at {max_depth} tokens) marker={MARKER!r}")
 
     # Build trial inputs once, reused for every config (same contexts, only cache differs).
     inputs_by_depth: dict[int, torch.Tensor] = {}
-    for depth in depths:
+    for depth in DEPTHS:
         d = min(depth, max_depth)
-        inputs_by_depth[d] = build_trials(tokenizer, args.marker, d, args.trials, args.seed)
+        inputs_by_depth[d] = build_trials(tokenizer, MARKER, d, TRIALS, SEED)
 
     table: dict[str, dict[int, float]] = {}
     for name, spec in specs:
         t0 = time.time()
         table[name] = run_config(
-            model, tokenizer, inputs_by_depth, args.marker, args.max_new_tokens, args.device, config_text, spec
+            model, tokenizer, inputs_by_depth, MARKER, MAX_NEW_TOKENS, DEVICE, config_text, spec
         )
         print(f"[{name}] done in {time.time() - t0:.0f}s")
 
@@ -212,14 +206,14 @@ def main() -> None:
         print(f"{depth:<8}{row}")
 
     payload = {
-        "marker": args.marker,
-        "trials": args.trials,
-        "max_new_tokens": args.max_new_tokens,
-        "seed": args.seed,
+        "marker": MARKER,
+        "trials": TRIALS,
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "seed": SEED,
         "recall": {name: {str(d): table[name][d] for d in table[name]} for name, _ in specs},
     }
-    if args.out:
-        out = Path(args.out)
+    if OUT:
+        out = Path(OUT)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2))
         print(f"\nwrote {out}")

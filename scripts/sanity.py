@@ -1,29 +1,36 @@
 """Sanity checks for the FibQuant cache on Qwen3.5-0.8B.
 
+Configure via the constants below and run the file directly — no CLI
+arguments:
+
+    .venv/bin/python scripts/sanity.py
+
 1. Roundtrip: encode/decode random Gaussian vectors, report cosine similarity.
-2. Logits: fp16 baseline vs FibQuant (per the given --spec) on a fixed prompt,
+2. Logits: fp16 baseline vs FibQuant (per SPEC_PATH) on a fixed prompt,
    report max abs diff and KL divergence over the last-token logits.
 3. Memory: persistent stored bytes per full-attention layer vs fp16.
 
-Usage:  .venv/bin/python scripts/sanity.py --spec models/fibquant/fibquant_d256_k4_N256.pt
-        .venv/bin/python scripts/sanity.py --spec models/fibquant/fibquant_d256_k4_N65536.pt  # b=4
+Model loading goes through fibquant.eval_harness.load_model (single home for
+the MPS single-worker fix).
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForImageTextToText, AutoTokenizer, DynamicCache
+from transformers import AutoTokenizer, DynamicCache
 
 # Make the repo root importable even when run as "python scripts/foo.py".
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fibquant import FibQuantCache, FibQuantSpec, decode, encode, enable_fibquant, load_spec
+from fibquant import FibQuantCache, FibQuantRuntime, FibQuantSpec, decode, encode
+from fibquant.eval_harness import load_model
 
 MODEL_DIR = "models/Qwen3.5-0.8B"
+SPEC_PATH = "models/fibquant/fibquant_d256_k4_N256.pt"  # N256=b2, N4096=b3, N65536=b4
+DEVICE = "mps"  # "cuda" on Databricks
 
 
 def roundtrip(spec: FibQuantSpec) -> None:
@@ -37,16 +44,9 @@ def roundtrip(spec: FibQuantSpec) -> None:
     print(f"[roundtrip] cosine sim: mean={cos.mean():.4f} min={cos.min():.4f}  rel-mse={rel_mse:.4f}")
 
 
-def _load_model(device: str) -> torch.nn.Module:
-    model = AutoModelForImageTextToText.from_pretrained(MODEL_DIR, dtype=torch.bfloat16)
-    model.to(device)
-    model.eval()
-    return model
-
-
 def logit_diff(spec: FibQuantSpec, device: str) -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = _load_model(device)
+    model = load_model(MODEL_DIR, device)
 
     prompt = "The quick brown fox jumps over the lazy dog. The capital of France is"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -82,8 +82,9 @@ def logit_diff(spec: FibQuantSpec, device: str) -> None:
 
 def memory_accounting(spec: FibQuantSpec, device: str) -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = _load_model(device)
-    enable_fibquant(model, spec)
+    model = load_model(MODEL_DIR, device)
+    # per-instance install: this model's forward is wrapped; the class is untouched
+    FibQuantRuntime(spec).install(model=model)
 
     prompt = "Once upon a time there was a very long story about a small model." * 32
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -101,22 +102,12 @@ def memory_accounting(spec: FibQuantSpec, device: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--spec",
-        type=str,
-        required=True,
-        help="FibQuant spec checkpoint, e.g. fibquant_d256_k4_N256.pt (b=2) or fibquant_d256_k4_N65536.pt (b=4)",
-    )
-    parser.add_argument("--device", type=str, default="mps")
-    args = parser.parse_args()
-
-    spec = FibQuantSpec.from_checkpoint(load_spec(args.spec))
+    spec = FibQuantSpec.from_path(SPEC_PATH)
     print(f"spec: d={spec.d} k={spec.k} N={spec.n_levels} b={spec.bits_per_coord} bits/coord")
 
     roundtrip(spec)
-    logit_diff(spec, args.device)
-    memory_accounting(spec, args.device)
+    logit_diff(spec, DEVICE)
+    memory_accounting(spec, DEVICE)
 
 
 if __name__ == "__main__":

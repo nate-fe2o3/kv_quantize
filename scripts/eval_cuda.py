@@ -1,7 +1,8 @@
 """Run lm-eval on Qwen3.5-0.8B, optionally with FibQuant KV compression.
 
 NVIDIA GPU variant (Databricks notebook): runs on CUDA. Configure via the
-constants below and execute the file/cell directly -- no CLI arguments.
+constants below and execute the file/cell directly — no CLI arguments. The
+script is thin: constants -> EvalConfig -> fibquant.eval_harness.run_eval.
 
 Databricks (serverless) setup:
 1. Attach the custom environment: notebook Environment side pane >
@@ -14,7 +15,6 @@ Databricks (serverless) setup:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -50,7 +50,6 @@ except TypeError:
 BITS = 2  # FibQuant bits/coordinate: 2, 3, or 4 (N_LEVELS = 1 << (BITS * K); the codebook checkpoint must exist)
 FIBQUANT_K = 4  # coordinates per codebook block
 FIBQUANT_D = 256  # per-head key/value dim
-N_LEVELS = 1 << (BITS * FIBQUANT_K)  # codebook size implied by (BITS, K)
 
 # --- environment layout --------------------------------------------------
 # A Databricks notebook's CWD is not the repo root, so relative paths like
@@ -85,9 +84,7 @@ _MODELS_DIR = Path(MODELS_DIR).expanduser() if MODELS_DIR else _REPO_ROOT / "mod
 
 # --- run configuration ---------------------------------------------------
 MODEL_DIR = str(_MODELS_DIR / "Qwen3.5-0.8B")
-SPEC_PATH = str(
-    _MODELS_DIR / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{N_LEVELS}.pt"
-)
+SPEC_PATH = str(_MODELS_DIR / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{1 << (BITS * FIBQUANT_K)}.pt")
 ENABLE_FIBQUANT = True
 TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"
 OUTPUT_DIR = "results/qwen3.5-0.8b"
@@ -109,53 +106,10 @@ if DATASETS_CACHE_DIR:
     os.environ.setdefault("HF_DATASETS_CACHE", DATASETS_CACHE_DIR)
 
 
-def _patch_generation(penalty: float, spec) -> None:
-    """Patch lm-eval's generate path:
-    - transformers 5.x dropped `presence_penalty`; emulate the OpenAI-style
-      additive penalty with a logits processor.
-    - when a FibQuant spec is given, inject a FibQuantCache so generate()
-      actually compresses (lm-eval passes no cache, so generate would
-      otherwise build a plain DynamicCache and skip compression entirely).
-    """
-    import lm_eval.models.huggingface as hf_mod
-    import torch
-    from transformers.generation.logits_process import LogitsProcessor
-
-    from fibquant import FibQuantCache
-
-    if penalty:
-
-        class PresencePenaltyLogitsProcessor(LogitsProcessor):
-            def __init__(self, penalty: float):
-                self.penalty = penalty
-
-            def __call__(
-                self, input_ids: torch.Tensor, scores: torch.Tensor
-            ) -> torch.Tensor:
-                generated = torch.unique(input_ids)
-                scores[:, generated] = scores[:, generated] - self.penalty
-                return scores
-
-    original = hf_mod.HFLM._model_generate
-
-    def patched(self, context, max_length, stop, **generation_kwargs):
-        generation_kwargs.pop("presence_penalty", None)
-        if penalty:
-            generation_kwargs["logits_processor"] = [
-                PresencePenaltyLogitsProcessor(penalty)
-            ]
-        if spec is not None:
-            generation_kwargs["past_key_values"] = FibQuantCache(
-                config=self.model.config, spec=spec
-            )
-        return original(
-            self, context, max_length=max_length, stop=stop, **generation_kwargs
-        )
-
-    hf_mod.HFLM._model_generate = patched
-
-
 def main() -> None:
+    from fibquant import FibQuantSpec
+    from fibquant.eval_harness import EvalConfig, run_eval
+
     if not Path(MODEL_DIR).exists():
         logging.warning(
             "model directory not found: %s -- upload models/ to DBFS/UC volume and set "
@@ -171,65 +125,25 @@ def main() -> None:
                 f"upload it alongside the model checkpoints (e.g. DBFS/UC volume) and set "
                 f"MODELS_DIR at the top of this script"
             )
-        from fibquant import FibQuantSpec, enable_fibquant, load_spec
+        spec = FibQuantSpec.from_path(SPEC_PATH)
 
-        spec = FibQuantSpec.from_checkpoint(load_spec(SPEC_PATH))
-        logging.info(
-            "enabling FibQuant: d=%d k=%d N=%d b=%.1f bits/coord",
-            spec.d,
-            spec.k,
-            spec.n_levels,
-            spec.bits_per_coord,
+    run_eval(
+        EvalConfig(
+            model_dir=MODEL_DIR,
+            device="cuda",
+            tasks=TASKS,
+            batch_size=BATCH_SIZE,
+            limit=LIMIT,
+            max_length=MAX_LENGTH,
+            apply_chat_template=APPLY_CHAT_TEMPLATE,
+            system_instruction=SYSTEM_INSTRUCTION,
+            gen_kwargs=GEN_KWARGS,
+            cache_requests=CACHE_REQUESTS,
+            output_dir=OUTPUT_DIR,
+            tag=TAG,
+            spec=spec,
         )
-        enable_fibquant(None, spec)
-
-    gen_kwargs = GEN_KWARGS
-    if gen_kwargs and "presence_penalty" in gen_kwargs:
-        logging.info(
-            "presence_penalty=%.1f requested: transformers 5.x removed it from GenerationConfig, "
-            "injecting a PresencePenaltyLogitsProcessor via HFLM._model_generate",
-            gen_kwargs["presence_penalty"],
-        )
-    if (gen_kwargs and "presence_penalty" in gen_kwargs) or ENABLE_FIBQUANT:
-        _patch_generation(
-            penalty=gen_kwargs.get("presence_penalty", 0.0) if gen_kwargs else 0.0,
-            spec=spec if ENABLE_FIBQUANT else None,
-        )
-
-    from lm_eval import simple_evaluate
-
-    model_args = {
-        "pretrained": MODEL_DIR,
-        "dtype": "bfloat16",
-        "max_length": MAX_LENGTH,
-        "device": "cuda",
-    }
-    results = simple_evaluate(
-        model="hf",
-        model_args=model_args,
-        tasks=TASKS,
-        num_fewshot=None,
-        batch_size=BATCH_SIZE,
-        limit=LIMIT,
-        apply_chat_template=APPLY_CHAT_TEMPLATE,
-        system_instruction=SYSTEM_INSTRUCTION,
-        gen_kwargs=gen_kwargs,
-        cache_requests=CACHE_REQUESTS,
     )
-
-    out_dir = Path(OUTPUT_DIR) / TAG
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "results.json"
-
-    def _json_default(o):
-        if hasattr(o, "item"):
-            return o.item()
-        if isinstance(o, (Path,)):
-            return str(o)
-        return str(o)
-
-    path.write_text(json.dumps(results, indent=2, default=_json_default))
-    logging.info("results written to %s", path)
 
 
 main()

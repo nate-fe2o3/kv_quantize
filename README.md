@@ -1,0 +1,30 @@
+# kv-quantize
+
+FibQuant: universal vector quantization for random-access KV-cache compression
+of Qwen3.5 full-attention layers (radial-angular codebook, arXiv:2605.11478).
+Persistent KV memory drops ~8x at b=2 bits/coord (k=4, N=256), ~5.2x at b=3
+(pair-packed), ~3.9x at b=4.
+
+- **Domain model and seams:** [`CONTEXT.md`](CONTEXT.md) — read this first.
+- **Codebook construction:** [`scripts/build_codebook.py`](scripts/build_codebook.py)
+- **Run-time codec:** `fibquant/quantize.py` (encode/decode/packing)
+- **Transformers integration:** `fibquant/cache.py` (`FibQuantCache`, `enable_fibquant`)
+- **Evaluations:** `scripts/eval.py` / `scripts/eval_cuda.py` (CUDA/Databricks,
+  see `env.yaml`) — both are thin configs over `fibquant/eval_harness.py`,
+  tuned via the constants at the top of each script (no CLI arguments)
+- **Sanity checks:** `scripts/sanity.py` (roundtrip, logits, memory)
+- **Long-range recall probe:** `scripts/key_recall.py`
+- **Unit tests:** `pytest` (CPU-only; no model or GPU needed)
+
+Quick start:
+
+Every script is configured by constants at the top of its file (no CLI
+arguments), so the same file runs locally and in Databricks:
+
+```bash
+.venv/bin/python -m pytest                     # unit tests
+.venv/bin/python scripts/sanity.py             # constants: SPEC_PATH, DEVICE
+.venv/bin/python scripts/build_codebook.py     # constants: D, K, N_LEVELS, ...
+.venv/bin/python scripts/eval.py               # constants: BITS, TASKS, TAG, ...
+.venv/bin/python scripts/key_recall.py         # constants: BITS, DEPTHS, TRIALS, ...
+```

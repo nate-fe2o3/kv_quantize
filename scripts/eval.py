@@ -1,20 +1,17 @@
 """Run lm-eval on Qwen3.5-0.8B, optionally with FibQuant KV compression.
 
-Usage:
-    # baseline
-    .venv/bin/python scripts/eval.py --tag baseline --tasks hellaswag,wikitext
-    # fibquant (default b=2 spec)
-    .venv/bin/python scripts/eval.py --tag fibquant-b2 --fibquant --tasks hellaswag,wikitext
-    # fibquant (b=4: --bits resolves the spec path)
-    .venv/bin/python scripts/eval.py --tag fibquant-b4 --fibquant --bits 4 --tasks hellaswag,wikitext
-    # quick smoke
-    .venv/bin/python scripts/eval.py --tag smoke --fibquant --tasks hellaswag --limit 20
+Configure via the constants below and run the file directly — no CLI
+arguments, so the same file works locally, in a notebook, and in Databricks:
+
+    .venv/bin/python scripts/eval.py
+
+The script is thin: constants -> EvalConfig -> fibquant.eval_harness.run_eval,
+which owns the lm-eval integration quirks. Edit the constants for each run
+(see scripts/eval_cuda.py for the CUDA/Databricks twin).
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -24,158 +21,61 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 
+from fibquant import FibQuantSpec
+from fibquant.eval_harness import EvalConfig, run_eval
+
 MODEL_DIR = "models/Qwen3.5-0.8B"
+DEVICE = "mps"  # "cuda" on Databricks
 
+# --- quantization width --------------------------------------------------
+BITS = 2  # bits/coordinate: 2, 3, or 4 (the codebook checkpoint must exist)
+FIBQUANT_K = 4
+FIBQUANT_D = 256
 
-def _patch_generation(penalty: float, spec) -> None:
-    """Patch lm-eval's generate path:
-    - transformers 5.x dropped `presence_penalty`; emulate the OpenAI-style
-      additive penalty with a logits processor.
-    - when a FibQuant spec is given, inject a FibQuantCache so generate()
-      actually compresses (lm-eval passes no cache, so generate would
-      otherwise build a plain DynamicCache and skip compression entirely).
-    """
-    import lm_eval.models.huggingface as hf_mod
-    import torch
-    from transformers.generation.logits_process import LogitsProcessor
+# Explicit spec checkpoint overrides the derived default (e.g. for a nonstandard
+# k); None = models/fibquant/fibquant_d{D}_k{K}_N{1 << (BITS * K)}.pt
+SPEC_PATH = None
+ENABLE_FIBQUANT = True
 
-    from fibquant import FibQuantCache
-
-    if penalty:
-
-        class PresencePenaltyLogitsProcessor(LogitsProcessor):
-            def __init__(self, penalty: float):
-                self.penalty = penalty
-
-            def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-                generated = torch.unique(input_ids)
-                scores[:, generated] = scores[:, generated] - self.penalty
-                return scores
-
-    original = hf_mod.HFLM._model_generate
-
-    def patched(self, context, max_length, stop, **generation_kwargs):
-        generation_kwargs.pop("presence_penalty", None)
-        if penalty:
-            generation_kwargs["logits_processor"] = [PresencePenaltyLogitsProcessor(penalty)]
-        if spec is not None:
-            generation_kwargs["past_key_values"] = FibQuantCache(config=self.model.config, spec=spec)
-        return original(self, context, max_length=max_length, stop=stop, **generation_kwargs)
-
-    hf_mod.HFLM._model_generate = patched
+# --- run configuration ---------------------------------------------------
+TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"  # output subdirectory under OUTPUT_DIR
+OUTPUT_DIR = "results/qwen3.5-0.8b"
+TASKS = ["hellaswag", "wikitext"]
+LIMIT = None  # eval limit (testing only)
+BATCH_SIZE = 8
+MAX_LENGTH = 2048
+APPLY_CHAT_TEMPLATE = False  # wrap docs with the model chat template
+CACHE_REQUESTS = False  # cache lm-eval requests to disk (retry-safe)
+SYSTEM_INSTRUCTION = None  # system message for chat template
+GEN_KWARGS = None  # e.g. {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "presence_penalty": 0.5}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tag", type=str, required=True, help="output subdirectory under results/qwen3.5-0.8b/")
-    parser.add_argument("--tasks", type=str, default="hellaswag,wikitext")
-    parser.add_argument("--limit", type=int, default=None, help="eval limit (testing only)")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--fibquant", action="store_true", help="enable FibQuant compression")
-    parser.add_argument(
-        "--spec",
-        type=str,
-        default=None,
-        help="FibQuant spec checkpoint; required with --fibquant unless --bits is given",
-    )
-    parser.add_argument(
-        "--bits",
-        type=int,
-        choices=(2, 3, 4),
-        default=None,
-        help="bits/coord; with --fibquant resolves --spec via default_spec_path (d=256, k=4)",
-    )
-    parser.add_argument("--output-dir", type=str, default="results/qwen3.5-0.8b")
-    parser.add_argument("--apply-chat-template", action="store_true", help="wrap docs with the model chat template")
-    parser.add_argument("--cache-requests", action="store_true", help="cache lm-eval requests to disk (retry-safe)")
-    parser.add_argument("--system-instruction", type=str, default=None, help="system message for chat template")
-    parser.add_argument(
-        "--gen-kwargs",
-        type=str,
-        default=None,
-        help="comma-separated k=v overrides for generation kwargs, e.g. do_sample=true,temperature=0.7,top_p=0.8",
-    )
-    args = parser.parse_args()
+    if ENABLE_FIBQUANT:
+        if SPEC_PATH is not None:
+            spec = FibQuantSpec.from_path(SPEC_PATH)
+        else:
+            spec = FibQuantSpec.from_bits(d=FIBQUANT_D, k=FIBQUANT_K, bits=BITS)
+    else:
+        spec = None
 
-    if args.fibquant:
-        from fibquant import FibQuantSpec, default_spec_path, enable_fibquant, load_spec
-
-        spec_path = args.spec
-        if spec_path is None:
-            if args.bits is None:
-                parser.error("--fibquant requires --spec (or --bits 2/3/4)")
-            spec_path = str(default_spec_path(d=256, k=4, n_levels=1 << (args.bits * 4)))
-        spec = FibQuantSpec.from_checkpoint(load_spec(spec_path))
-        logging.info("enabling FibQuant: d=%d k=%d N=%d b=%.1f bits/coord", spec.d, spec.k, spec.n_levels, spec.bits_per_coord)
-        enable_fibquant(None, spec)
-
-    gen_kwargs = None
-    if args.gen_kwargs:
-        gen_kwargs = {}
-        for kv in args.gen_kwargs.split(","):
-            key, value = kv.split("=", 1)
-            lowered = value.lower()
-            if lowered in ("true", "false"):
-                gen_kwargs[key] = lowered == "true"
-            else:
-                try:
-                    gen_kwargs[key] = int(value) if "." not in value else float(value)
-                except ValueError:
-                    gen_kwargs[key] = value
-
-    if gen_kwargs and "presence_penalty" in gen_kwargs:
-        logging.info(
-            "presence_penalty=%.1f requested: transformers 5.x removed it from GenerationConfig, "
-            "injecting a PresencePenaltyLogitsProcessor via HFLM._model_generate",
-            gen_kwargs["presence_penalty"],
+    run_eval(
+        EvalConfig(
+            model_dir=MODEL_DIR,
+            device=DEVICE,
+            tasks=TASKS,
+            batch_size=BATCH_SIZE,
+            limit=LIMIT,
+            max_length=MAX_LENGTH,
+            apply_chat_template=APPLY_CHAT_TEMPLATE,
+            system_instruction=SYSTEM_INSTRUCTION,
+            gen_kwargs=GEN_KWARGS,
+            cache_requests=CACHE_REQUESTS,
+            output_dir=OUTPUT_DIR,
+            tag=TAG,
+            spec=spec,
         )
-    if gen_kwargs and "presence_penalty" in gen_kwargs or args.fibquant:
-        _patch_generation(
-            penalty=gen_kwargs.get("presence_penalty", 0.0) if gen_kwargs else 0.0,
-            spec=spec if args.fibquant else None,
-        )
-
-    from lm_eval import simple_evaluate
-
-    # Flaky MPS segfault in transformers' threaded weight copy (_materialize_copy);
-    # serialize loading to a single worker.
-    import transformers.core_model_loading as cml
-
-    cml.GLOBAL_WORKERS = 1
-
-    model_args = {
-        "pretrained": MODEL_DIR,
-        "dtype": "bfloat16",
-        "max_length": args.max_length,
-        "device": "mps",
-    }
-    results = simple_evaluate(
-        model="hf",
-        model_args=model_args,
-        tasks=args.tasks.split(","),
-        num_fewshot=None,
-        batch_size=args.batch_size,
-        limit=args.limit,
-        apply_chat_template=args.apply_chat_template,
-        system_instruction=args.system_instruction,
-        gen_kwargs=gen_kwargs,
-        cache_requests=args.cache_requests,
     )
-
-    out_dir = Path(args.output_dir) / args.tag
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "results.json"
-
-    def _json_default(o):
-        if hasattr(o, "item"):
-            return o.item()
-        if isinstance(o, (Path,)):
-            return str(o)
-        return str(o)
-
-    path.write_text(json.dumps(results, indent=2, default=_json_default))
-    logging.info("results written to %s", path)
 
 
 if __name__ == "__main__":

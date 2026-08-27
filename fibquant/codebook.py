@@ -15,10 +15,12 @@ All of it is deterministic given the seed and shared across layers/heads/prompts
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import numpy
 import torch
+
+from .scoring import DEFAULT_SCORE_BYTES, nearest
+
 
 
 def fib_phi(k: int) -> float:
@@ -73,49 +75,13 @@ def build_directions(k: int, n_levels: int) -> torch.Tensor:
     return u.to(torch.float32)
 
 
-_DEFAULT_SCORE_MB = 1024  # approx MB of one (chunk, N) score matrix
-
-
-def _chunk_rows(n_levels: int, score_mb: int = _DEFAULT_SCORE_MB) -> int:
-    """Sample rows per score chunk so the (chunk, N) fp32 matrix is ~score_mb."""
-    return max(1, int(score_mb * 2**20) // (n_levels * 4))
-
-
-def _assign_chunked(
-    sample_aug: torch.Tensor,
-    sample_norm2: torch.Tensor,
-    codebook_aug: torch.Tensor,
-    chunk_rows: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Nearest-codeword assignment without materializing (n, N) or (n, N, k).
-
-    With score(s, c) = 2<s, c> - ||c||^2, argmin_j ||s - c_j||^2 == argmax_j
-    score(s, c_j), and the assigned distance is exactly ||s||^2 - max_score.
-    score(c) is computed over row chunks so peak memory is O(chunk_rows x N).
-    Returns (assign int64, assigned d2 fp32).
-    """
-    n = sample_aug.shape[0]
-    assign = torch.empty(n, dtype=torch.int64)
-    max_score = torch.empty(n, dtype=torch.float32)
-    for start in range(0, n, chunk_rows):
-        end = min(start + chunk_rows, n)
-        scores = sample_aug[start:end] @ codebook_aug.t()  # (chunk, N)
-        a = scores.argmax(-1)
-        assign[start:end] = a
-        max_score[start:end] = scores.gather(1, a.unsqueeze(-1)).squeeze(-1)
-    return assign, sample_norm2 - max_score
-
-
 def _mean_sq_err(
     samples: torch.Tensor,
     codebook: torch.Tensor,
-    chunk_rows: int,
+    max_score_bytes: int = DEFAULT_SCORE_BYTES,
 ) -> float:
-    """Mean squared distance to the nearest codeword (chunked, no (n, N, k))."""
-    sample_aug = torch.cat([2.0 * samples, -torch.ones_like(samples[..., :1])], dim=-1)
-    sample_norm2 = samples.square().sum(-1)
-    codebook_aug = torch.cat([codebook, codebook.square().sum(-1, keepdim=True)], dim=-1)
-    _, assigned_d2 = _assign_chunked(sample_aug, sample_norm2, codebook_aug, chunk_rows)
+    """Mean squared distance to the nearest codeword (chunked via scoring.nearest)."""
+    _, assigned_d2 = nearest(samples, codebook, max_score_bytes=max_score_bytes)
     return assigned_d2.mean().item()
 
 
@@ -124,26 +90,23 @@ def _lloyd_max(
     samples: torch.Tensor,
     iters: int,
     seed: int,
-    chunk_rows: int,
+    max_score_bytes: int = DEFAULT_SCORE_BYTES,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lloyd-Max polish with empty-cell repair (split highest-distortion cell).
 
-    Uses the augmented-score identity so assignment needs no (n, N, k)
-    distance tensor: only (chunk_rows, N) score matrices plus
-    index_add_/bincount/scatter_add_ accumulators. Returns (codebook, counts),
-    where counts = samples assigned to each codeword after the last iteration
-    (zeros are dead codewords).
+    Assignment is delegated to scoring.nearest (augmented-score identity,
+    chunked), so no (n, N, k) distance tensor is materialized; centroids use
+    index_add_/bincount accumulators. Returns (codebook, counts), where counts
+    = samples assigned to each codeword after the last iteration (zeros are
+    dead codewords).
     """
     n, k = samples.shape
     n_levels = codebook.shape[0]
     g = torch.Generator().manual_seed(seed)
     c = codebook.clone()
-    sample_aug = torch.cat([2.0 * samples, -torch.ones_like(samples[..., :1])], dim=-1)
-    sample_norm2 = samples.square().sum(-1)
     counts = None
     for _ in range(iters):
-        codebook_aug = torch.cat([c, c.square().sum(-1, keepdim=True)], dim=-1)
-        assign, d2_assigned = _assign_chunked(sample_aug, sample_norm2, codebook_aug, chunk_rows)
+        assign, d2_assigned = nearest(samples, c, max_score_bytes=max_score_bytes)
 
         centroids = torch.zeros(n_levels, k, dtype=samples.dtype)
         centroids.index_add_(0, assign, samples)  # sum of samples per cell
@@ -171,7 +134,7 @@ def build_codebook(
     restarts: int = 4,
     lloyd_iters: int = 25,
     m_factor: int = 30,
-    score_mb: int = _DEFAULT_SCORE_MB,
+    max_score_bytes: int = DEFAULT_SCORE_BYTES,
     return_counts: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build the shared FibQuant codebook for the spherical-Beta source f_{d,k}.
@@ -184,51 +147,15 @@ def build_codebook(
     init = radii.unsqueeze(-1) * directions  # (N, k)
 
     samples = sample_spherical_beta(d, k, m_factor * n_levels, seed)
-    chunk_rows = _chunk_rows(n_levels, score_mb)
 
     best_cb, best_mse, best_counts = None, float("inf"), None
     for restart in range(restarts):
         g = torch.Generator().manual_seed(seed + 1 + restart)
         rot = torch.linalg.qr(torch.randn(k, k, generator=g))[0]
-        c, counts = _lloyd_max(init @ rot, samples, lloyd_iters, seed + 100 + restart, chunk_rows)
-        mse = _mean_sq_err(samples, c, chunk_rows)
+        c, counts = _lloyd_max(
+            init @ rot, samples, lloyd_iters, seed + 100 + restart, max_score_bytes
+        )
+        mse = _mean_sq_err(samples, c, max_score_bytes)
         if mse < best_mse:
             best_cb, best_mse, best_counts = c, mse, counts
     return (best_cb, best_counts) if return_counts else best_cb
-
-
-def save_spec(
-    path: str | Path,
-    codebook: torch.Tensor,
-    rotation: torch.Tensor,
-    d: int,
-    k: int,
-    n_levels: int,
-    seed: int,
-    mse: float,
-) -> None:
-    """Persist codebook + rotation to disk as a single checkpoint."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "codebook": codebook,
-            "rotation": rotation,
-            "d": d,
-            "k": k,
-            "n_levels": n_levels,
-            "seed": seed,
-            "mse": mse,
-        },
-        path,
-    )
-
-
-def load_spec(path: str | Path) -> dict:
-    """Load a FibQuant spec checkpoint (see save_spec)."""
-    return torch.load(path, map_location="cpu", weights_only=False)
-
-
-def default_spec_path(d: int, k: int, n_levels: int) -> Path:
-    """models/fibquant/fibquant_d{d}_k{k}_N{n_levels}.pt"""
-    return Path(__file__).resolve().parent.parent / "models" / "fibquant" / f"fibquant_d{d}_k{k}_N{n_levels}.pt"

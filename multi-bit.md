@@ -176,7 +176,7 @@ docstrings to say "one packed/unpacked container element per k-block".
 - `m_factor=30` is a `build_codebook()` keyword (`codebook.py:118`) not exposed in
   `scripts/build_codebook.py`. At N=65536 that's ~2M samples/restart; with the
   chunked scorer each Lloyd iteration is ~1.3 TFLOP — fine on CUDA, slow on MPS.
-  Expose `--m-factor`, and consider `--restarts 2` for the b=4 build.
+  Expose `M_FACTOR`, and consider `--restarts 2` for the b=4 build.
 - Dead codewords get likelier as N grows. `_lloyd_max` has empty-cell repair
   (`codebook.py:101-106`) but no reporting; add a final dead-cell count print to
   `scripts/build_codebook.py` and bump `m_factor`/`lloyd_iters` if it exceeds ~1%.
@@ -193,7 +193,7 @@ docstrings to say "one packed/unpacked container element per k-block".
    row chunking + `index_add_`/`bincount` centroids (2b); share the chunked scorer
    with `build_codebook`'s final-MSE loop (2c).
 3. `scripts/build_codebook.py`: chunk the (N, N, k) diagnostic (2d); expose
-   `--m-factor`; print dead-codeword count (issue 5).
+   `M_FACTOR`; print dead-codeword count (issue 5).
 4. `quantize.py` `bytes_per_token`: report container-based numbers alongside
    packed (issue 3a).
 5. Script/doc defaults sweep (issue 4).
@@ -201,13 +201,12 @@ docstrings to say "one packed/unpacked container element per k-block".
    a wraparound shows up there as roundtrip cosine ≈ 0.06):
 
 ```bash
-.venv/bin/python scripts/build_codebook.py --n-levels 65536          # b=4
-.venv/bin/python scripts/sanity.py --spec models/fibquant/fibquant_d256_k4_N65536.pt
-.venv/bin/python scripts/eval.py --tag fibquant-b4 --fibquant \
-    --spec models/fibquant/fibquant_d256_k4_N65536.pt --tasks hellaswag,wikitext
+.venv/bin/python scripts/build_codebook.py    # N_LEVELS = 65536 for b=4
+.venv/bin/python scripts/sanity.py            # SPEC_PATH = ...N65536.pt
+.venv/bin/python scripts/eval.py              # BITS = 4 (TAG derived), TASKS as wanted
 
-.venv/bin/python scripts/build_codebook.py --n-levels 4096           # b=3 (see issue 3)
-.venv/bin/python scripts/sanity.py --spec models/fibquant/fibquant_d256_k4_N4096.pt
+.venv/bin/python scripts/build_codebook.py    # N_LEVELS = 4096 for b=3 (see issue 3)
+.venv/bin/python scripts/sanity.py            # SPEC_PATH = ...N4096.pt
 ```
 
 **Acceptance criteria:** roundtrip cosine increases monotonically b=2 < b=3 < b=4

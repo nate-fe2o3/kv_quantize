@@ -1,7 +1,7 @@
 [project]
 name = "kv-quantize"
 version = "0.1.0"
-description = "Add your description here"
+description = "FibQuant KV-cache compression research"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,3 +13,6 @@ dependencies = [
     "scipy>=1.18.0",
     "transformers>=5.15",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

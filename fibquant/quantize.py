@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from .scoring import DEFAULT_SCORE_BYTES, nearest
+
 
 def index_dtype(n_levels: int) -> torch.dtype:
     """Smallest container dtype that can hold codeword indices in [0, n_levels)."""
@@ -19,7 +21,47 @@ def index_dtype(n_levels: int) -> torch.dtype:
     raise ValueError(f"n_levels={n_levels} exceeds uint16; not supported")
 
 
-_DEFAULT_SCORE_BYTES = 1 << 30  # 1 GiB budget for the fp32 (chunk, blocks, N) scores
+_BITS_PACKED = 12  # 12-bit indices (N=4096) pair-pack: 2 x 12 bits = 3 bytes exactly
+
+
+def pack_indices(indices: torch.Tensor, n_levels: int) -> torch.Tensor:
+    """Pack codeword indices into the compact per-row storage form.
+
+    8-bit (N <= 256) and 16-bit (N <= 65536) containers are already minimum
+    size and returned as-is. 12-bit indices (N = 4096) are pair-packed: two
+    consecutive indices per 3 bytes, stored flat as (..., 1.5 * blocks) uint8
+    so storage ops (cat/crop/reorder/select) operate on unchanged dims.
+
+    Byte layout per pair (even index e, odd index o):
+        b0 = e % 256,  b1 = (e // 256) * 16 + (o % 16),  b2 = o // 16
+    """
+    bits = int(n_levels - 1).bit_length()
+    if bits != _BITS_PACKED:
+        return indices
+    blocks = indices.shape[-1]
+    if blocks % 2:
+        raise ValueError(f"pair-packing requires an even number of blocks, got {blocks}")
+    idx = indices.long().view(*indices.shape[:-1], blocks // 2, 2)
+    even, odd = idx[..., 0], idx[..., 1]  # each in [0, n_levels)
+    b0 = (even % 256).to(torch.uint8)
+    b1 = ((even // 256) * 16 + (odd % 16)).to(torch.uint8)
+    b2 = (odd // 16).to(torch.uint8)
+    return torch.stack([b0, b1, b2], dim=-1).reshape(*indices.shape[:-1], -1)
+
+
+def unpack_indices(packed: torch.Tensor, n_levels: int) -> torch.Tensor:
+    """Inverse of pack_indices; returns (..., blocks) uint16 codeword indices.
+
+    Non-12-bit payloads are already in logical form and returned as-is.
+    """
+    bits = int(n_levels - 1).bit_length()
+    if bits != _BITS_PACKED:
+        return packed
+    x = packed.long().reshape(*packed.shape[:-1], -1, 3)
+    b0, b1, b2 = x[..., 0], x[..., 1], x[..., 2]
+    even = b0 + (b1 // 16) * 256
+    odd = (b1 % 16) + b2 * 16
+    return torch.stack([even, odd], dim=-1).reshape(*packed.shape[:-1], -1).to(torch.uint16)
 
 
 @torch.no_grad()
@@ -28,7 +70,7 @@ def encode(
     codebook: torch.Tensor,
     rotation: torch.Tensor,
     k: int,
-    max_score_bytes: int = _DEFAULT_SCORE_BYTES,
+    max_score_bytes: int = DEFAULT_SCORE_BYTES,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize x -> (indices, norms).
 
@@ -36,12 +78,10 @@ def encode(
              (dtype chosen from codebook size; see index_dtype).
     norms:   (B, H, S) fp16, per-vector L2 norms.
 
-    The nearest-codeword search avoids materializing the full (B,H,S,d/k,N)
-    distance tensor. Since ||y||^2 is constant per block, minimizing
-    ||y - c_j||^2 is equivalent to maximizing <[2y, -1], [c_j, ||c_j||^2]>,
-    i.e. a single matmul in R^{k+1} followed by argmax. The score tensor is
-    computed row-chunked so peak memory stays ~max_score_bytes regardless of
-    N; the results are identical to the previous one-shot computation.
+    Nearest-codeword search is delegated to the shared chunked scorer
+    (scoring.nearest) — the same implementation offline codebook construction
+    uses, so the training and deployment geometry cannot drift. Peak memory
+    stays ~max_score_bytes regardless of N.
     """
     norms = x.norm(dim=-1)
     safe = norms.clamp(min=1e-6)
@@ -49,24 +89,12 @@ def encode(
     y = y @ rotation.to(x.device)  # (B, H, S, d)
     y = y.view(*y.shape[:-1], -1, k)  # (B, H, S, d/k, k)
 
-    codebook_aug = torch.cat(
-        [codebook, codebook.square().sum(-1, keepdim=True)], dim=-1
-    ).to(x.device)  # (N, k+1) -> [c, ||c||^2]
-    y_a = torch.cat([2 * y, -torch.ones_like(y[..., :1])], dim=-1)  # (..., d/k, k+1)
-
     n_levels = codebook.shape[0]
     dtype = index_dtype(n_levels)
-    blocks = y_a.shape[-2]
-    rows = y_a.numel() // (blocks * y_a.shape[-1])
-    y_a = y_a.reshape(rows, blocks, -1)  # (rows, d/k, k+1)
-    indices = torch.empty(rows, blocks, dtype=dtype, device=x.device)
-    chunk_rows = max(1, max_score_bytes // (blocks * n_levels * 4))
-    for start in range(0, rows, chunk_rows):
-        end = min(start + chunk_rows, rows)
-        scores = y_a[start:end] @ codebook_aug.t()  # (chunk, d/k, N)
-        indices[start:end] = scores.argmax(-1).to(dtype)
-
-    indices = indices.view(*x.shape[:-1], blocks)
+    blocks = y.shape[-2]
+    rows = y.numel() // k  # = B * H * S * blocks
+    idx, _ = nearest(y.reshape(rows, k), codebook, max_score_bytes=max_score_bytes)
+    indices = idx.view(*y.shape[:-2], blocks).to(dtype)
     norms_f16 = safe.to(torch.float16)
     return indices, norms_f16
 
@@ -80,6 +108,10 @@ def decode(
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Dequantize (indices, norms) back to a (B, H, S, d) tensor."""
+    if indices.numel() == 0:
+        # Empty cache (e.g. after crop(0)): reshape of 0 elements is ambiguous.
+        d = codebook.shape[1]  # blocks * k
+        return torch.empty(*indices.shape[:-1], d, dtype=dtype, device=indices.device)
     y = codebook.to(indices.device)[indices.long()]  # (B, H, S, d/k, k)
     y = y.reshape(*y.shape[:-2], -1)  # (B, H, S, d)
     x = y @ rotation.to(indices.device).t()
@@ -91,17 +123,17 @@ def bytes_per_token(d: int, k: int, n_levels: int) -> dict[str, float]:
     """Payload bytes per token per (K or V) head vector, plus the fp16 reference.
 
     Two payload figures are reported:
-      - packed:    idealized bitstream size (bits may not fill a container)
-      - container: actual storage (one uint8/uint16 element per k-block)
+      - packed:    actual storage (pair-packed bitstream for 12-bit indices)
+      - container: one uint8/uint16 element per k-block (no bit-packing)
 
-    At b=2 (N=256) and b=4 (N=65536) container == packed. At b=3 (N=4096,
-    12-bit indices) the uint16 container makes storage identical to b=4
-    unless true bit-packing is implemented.
+    At b=3 (N=4096, 12-bit indices) pair-packing stores two indices per 3
+    bytes, so packed < container: 96 B vs 128 B per head vector. At b=2 and
+    b=4 the two figures coincide. Norms are fp16 (2 B per head vector).
     """
     bits = int(n_levels - 1).bit_length()  # bits per block index
     blocks = d // k
     container_bytes = torch.empty(1, dtype=index_dtype(n_levels)).element_size()
-    payload_packed = blocks * bits / 8  # bytes
+    payload_packed = blocks * bits / 8  # bytes (pair-packed for 12-bit)
     payload_container = blocks * container_bytes  # bytes
     norm = 2  # fp16
     return {
@@ -110,6 +142,6 @@ def bytes_per_token(d: int, k: int, n_levels: int) -> dict[str, float]:
         "payload_bytes_per_head_vector": payload_packed,
         "payload_bytes_per_head_vector_container": payload_container,
         "norm_bytes_per_head_vector": norm,
-        "total_bytes_per_head_vector": payload_container + norm,
+        "total_bytes_per_head_vector": payload_packed + norm,
         "fp16_bytes_per_head_vector": d * 2,
     }
