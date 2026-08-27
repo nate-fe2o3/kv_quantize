@@ -1,9 +1,10 @@
 """FibQuant integration with transformers DynamicCache.
 
 `FibQuantLayer` replaces the per-layer KV storage for full-attention layers:
-keys/values are stored as (uint8 indices, fp16 norms) and decoded on read,
-so the attention interface is unchanged while persistent memory drops by ~8x
-at b=2 (k=4, N=256).
+keys/values are stored as (uint8/uint16 block indices, fp16 norms) and decoded
+on read, so the attention interface is unchanged while persistent memory drops
+by ~8x at b=2 (k=4, N=256) and ~3.9x at b=4 (k=4, N=65536). The index
+container dtype follows the codebook size (see quantize.index_dtype).
 
 Linear-attention (Gated DeltaNet) layers keep their recurrent-state machinery,
 which is inherited from `DynamicCache` untouched.
@@ -43,9 +44,23 @@ class FibQuantSpec:
 
     @classmethod
     def from_checkpoint(cls, ckpt: dict) -> "FibQuantSpec":
+        codebook = ckpt["codebook"]
+        rotation = ckpt["rotation"]
+        if codebook.shape[0] != ckpt["n_levels"]:
+            raise ValueError(
+                f"checkpoint n_levels={ckpt['n_levels']} != codebook rows {codebook.shape[0]}"
+            )
+        if codebook.shape[1] != ckpt["k"]:
+            raise ValueError(
+                f"checkpoint k={ckpt['k']} != codebook dim {codebook.shape[1]}"
+            )
+        if tuple(rotation.shape) != (ckpt["d"], ckpt["d"]):
+            raise ValueError(
+                f"checkpoint d={ckpt['d']} != rotation shape {tuple(rotation.shape)}"
+            )
         return cls(
-            codebook=ckpt["codebook"],
-            rotation=ckpt["rotation"],
+            codebook=codebook,
+            rotation=rotation,
             d=ckpt["d"],
             k=ckpt["k"],
             n_levels=ckpt["n_levels"],
@@ -53,7 +68,7 @@ class FibQuantSpec:
 
 
 class FibQuantLayer(DynamicLayer):
-    """Per-layer compressed KV cache: uint8 block indices + fp16 norms."""
+    """Per-layer compressed KV cache: uint8/uint16 block indices + fp16 norms."""
 
     def __init__(self, spec: FibQuantSpec):
         super().__init__()

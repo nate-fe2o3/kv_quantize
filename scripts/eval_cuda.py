@@ -47,7 +47,7 @@ except TypeError:
     ) from None
 
 # --- quantization width --------------------------------------------------
-BITS = 2  # FibQuant bits/coordinate (codebook checkpoint must exist for this)
+BITS = 2  # FibQuant bits/coordinate: 2, 3, or 4 (N_LEVELS = 1 << (BITS * K); the codebook checkpoint must exist)
 FIBQUANT_K = 4  # coordinates per codebook block
 FIBQUANT_D = 256  # per-head key/value dim
 N_LEVELS = 1 << (BITS * FIBQUANT_K)  # codebook size implied by (BITS, K)

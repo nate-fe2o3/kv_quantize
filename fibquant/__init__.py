@@ -13,7 +13,7 @@ from .codebook import (
     load_spec,
     save_spec,
 )
-from .quantize import bytes_per_token, decode, encode
+from .quantize import bytes_per_token, decode, encode, index_dtype
 
 __all__ = [
     "FibQuantCache",
@@ -30,4 +30,5 @@ __all__ = [
     "bytes_per_token",
     "decode",
     "encode",
+    "index_dtype",
 ]

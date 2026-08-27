@@ -3,8 +3,10 @@
 Usage:
     # baseline
     .venv/bin/python scripts/eval.py --tag baseline --tasks hellaswag,wikitext
-    # fibquant (b=2)
+    # fibquant (default b=2 spec)
     .venv/bin/python scripts/eval.py --tag fibquant-b2 --fibquant --tasks hellaswag,wikitext
+    # fibquant (b=4: --bits resolves the spec path)
+    .venv/bin/python scripts/eval.py --tag fibquant-b4 --fibquant --bits 4 --tasks hellaswag,wikitext
     # quick smoke
     .venv/bin/python scripts/eval.py --tag smoke --fibquant --tasks hellaswag --limit 20
 """
@@ -14,7 +16,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
+
+# Make the repo root importable even when run as "python scripts/foo.py".
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 
@@ -66,8 +72,20 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="eval limit (testing only)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--fibquant", action="store_true", help="enable FibQuant b=2 compression")
-    parser.add_argument("--spec", type=str, default="models/fibquant/fibquant_d256_k4_N256.pt")
+    parser.add_argument("--fibquant", action="store_true", help="enable FibQuant compression")
+    parser.add_argument(
+        "--spec",
+        type=str,
+        default=None,
+        help="FibQuant spec checkpoint; required with --fibquant unless --bits is given",
+    )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        choices=(2, 3, 4),
+        default=None,
+        help="bits/coord; with --fibquant resolves --spec via default_spec_path (d=256, k=4)",
+    )
     parser.add_argument("--output-dir", type=str, default="results/qwen3.5-0.8b")
     parser.add_argument("--apply-chat-template", action="store_true", help="wrap docs with the model chat template")
     parser.add_argument("--cache-requests", action="store_true", help="cache lm-eval requests to disk (retry-safe)")
@@ -81,9 +99,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fibquant:
-        from fibquant import FibQuantSpec, enable_fibquant, load_spec
+        from fibquant import FibQuantSpec, default_spec_path, enable_fibquant, load_spec
 
-        spec = FibQuantSpec.from_checkpoint(load_spec(args.spec))
+        spec_path = args.spec
+        if spec_path is None:
+            if args.bits is None:
+                parser.error("--fibquant requires --spec (or --bits 2/3/4)")
+            spec_path = str(default_spec_path(d=256, k=4, n_levels=1 << (args.bits * 4)))
+        spec = FibQuantSpec.from_checkpoint(load_spec(spec_path))
         logging.info("enabling FibQuant: d=%d k=%d N=%d b=%.1f bits/coord", spec.d, spec.k, spec.n_levels, spec.bits_per_coord)
         enable_fibquant(None, spec)
 

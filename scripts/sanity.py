@@ -1,19 +1,25 @@
 """Sanity checks for the FibQuant cache on Qwen3.5-0.8B.
 
 1. Roundtrip: encode/decode random Gaussian vectors, report cosine similarity.
-2. Logits: fp16 baseline vs FibQuant (b=2) on a fixed prompt, report max abs
-   diff and KL divergence over the last-token logits.
+2. Logits: fp16 baseline vs FibQuant (per the given --spec) on a fixed prompt,
+   report max abs diff and KL divergence over the last-token logits.
 3. Memory: persistent stored bytes per full-attention layer vs fp16.
 
-Usage:  .venv/bin/python scripts/sanity.py [--spec models/fibquant/fibquant_d256_k4_N256.pt]
+Usage:  .venv/bin/python scripts/sanity.py --spec models/fibquant/fibquant_d256_k4_N256.pt
+        .venv/bin/python scripts/sanity.py --spec models/fibquant/fibquant_d256_k4_N65536.pt  # b=4
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForImageTextToText, AutoTokenizer, DynamicCache
+
+# Make the repo root importable even when run as "python scripts/foo.py".
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fibquant import FibQuantCache, FibQuantSpec, decode, encode, enable_fibquant, load_spec
 
@@ -96,12 +102,16 @@ def memory_accounting(spec: FibQuantSpec, device: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spec", type=str, default=None)
+    parser.add_argument(
+        "--spec",
+        type=str,
+        required=True,
+        help="FibQuant spec checkpoint, e.g. fibquant_d256_k4_N256.pt (b=2) or fibquant_d256_k4_N65536.pt (b=4)",
+    )
     parser.add_argument("--device", type=str, default="mps")
     args = parser.parse_args()
 
-    spec_path = args.spec or "models/fibquant/fibquant_d256_k4_N256.pt"
-    spec = FibQuantSpec.from_checkpoint(load_spec(spec_path))
+    spec = FibQuantSpec.from_checkpoint(load_spec(args.spec))
     print(f"spec: d={spec.d} k={spec.k} N={spec.n_levels} b={spec.bits_per_coord} bits/coord")
 
     roundtrip(spec)
