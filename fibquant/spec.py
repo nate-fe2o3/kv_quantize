@@ -109,7 +109,13 @@ class FibQuantSpec:
 
     @classmethod
     def from_bits(cls, d: int, k: int, bits: int, path: str | Path | None = None) -> "FibQuantSpec":
-        """Load the operating point named by (d, k, bits); N = 1 << (bits * k)."""
+        """Load the operating point named by (d, k, bits); N = 1 << (bits * k).
+
+        With path=None the checkpoint is resolved from the repo-relative
+        default (models/fibquant/...), which only exists where models/ is
+        checked out. On Databricks checkpoints live on a volume, so pass
+        path= explicitly (or use SPEC_PATHS in the script constants).
+        """
         if bits < 1:
             raise ValueError(f"bits must be >= 1, got {bits}")
         n_levels = 1 << (bits * k)
@@ -117,7 +123,17 @@ class FibQuantSpec:
             raise ValueError(
                 f"bits={bits}, k={k} implies n_levels={n_levels} > 2^16; not supported"
             )
-        return cls.from_path(path if path is not None else spec_path(d, k, n_levels))
+        if path is None:
+            path = spec_path(d, k, n_levels)
+            if not Path(path).exists():
+                raise FileNotFoundError(
+                    f"no checkpoint at {path} (the repo-relative default for "
+                    f"d={d} k={k} bits={bits}, N={n_levels}). Build it with "
+                    f"scripts/build_codebook.py, or pass path= explicitly -- on "
+                    f"Databricks checkpoints live on a volume (e.g. /Volumes/...), "
+                    f"not next to the repo, so pass path= (or SPEC_PATHS) there."
+                )
+        return cls.from_path(path)
 
     def save(self, path: str | Path, *, seed: int | None = None, mse: float | None = None) -> None:
         """Persist codebook + rotation to disk as a single checkpoint."""

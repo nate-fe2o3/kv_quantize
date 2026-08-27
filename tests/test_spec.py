@@ -60,6 +60,14 @@ def test_from_bits_derives_n_levels_and_rejects_bad_bits(tmp_path):
         FibQuantSpec.from_bits(d=8, k=2, bits=0)
 
 
+def test_from_bits_default_path_missing_is_actionable(tmp_path):
+    # No path= and the repo-relative default checkpoint is absent (the
+    # Databricks volume case): the error must say what to do, not just
+    # "No such file or directory" from torch.load.
+    with pytest.raises(FileNotFoundError, match="pass path= explicitly"):
+        FibQuantSpec.from_bits(d=8, k=2, bits=2)  # models/fibquant/fibquant_d8_k2_N16.pt
+
+
 def test_save_load_roundtrip_preserves_checkpoint_dict(tmp_path):
     torch.manual_seed(0)
     spec = FibQuantSpec(

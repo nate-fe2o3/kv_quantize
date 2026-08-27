@@ -22,8 +22,11 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer, DynamicCache
 
-# Make the repo root importable even when run as "python scripts/foo.py".
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Make the repo root importable when run as "python scripts/foo.py". In a
+# Databricks notebook __file__ is undefined (NameError); the notebook's
+# directory is already on sys.path there, so skip the insert.
+if "__file__" in globals():
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fibquant import FibQuantCache, FibQuantRuntime, FibQuantSpec, decode, encode
 from fibquant.eval_harness import load_model

@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+# Keep env.yaml in sync with pyproject.toml on every commit that touches it.
+# Enable repo-wide with:  git config core.hooksPath .githooks
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+if ! git -C "$ROOT" diff --cached --name-only --diff-filter=ACMR | grep -qx "pyproject.toml"; then
+    exit 0
+fi
+
+echo "[.githooks] pyproject.toml changed -> regenerating env.yaml"
+if [ -x "$ROOT/.venv/bin/python" ]; then
+    "$ROOT/.venv/bin/python" "$ROOT/scripts/sync_env.py"
+elif command -v uv >/dev/null 2>&1; then
+    uv run --no-project python "$ROOT/scripts/sync_env.py"
+else
+    python3 "$ROOT/scripts/sync_env.py"
+fi
+
+git -C "$ROOT" add env.yaml
+if [ -f "$ROOT/uv.lock" ]; then
+    git -C "$ROOT" add uv.lock
+fi

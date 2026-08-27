@@ -26,22 +26,30 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-# Make the repo root importable even when run as "python scripts/foo.py".
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Make the repo root importable when run as "python scripts/foo.py". In a
+# Databricks notebook __file__ is undefined (NameError); the notebook's
+# directory is already on sys.path there, so skip the insert.
+if "__file__" in globals():
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fibquant import FibQuantCache, FibQuantSpec  # noqa: E402
 from fibquant.eval_harness import load_model  # noqa: E402
 
 # --- run configuration ---------------------------------------------------
-MODEL_DIR = "models/Qwen3.5-0.8B"
-DEVICE = "mps"  # "cuda" on Databricks
+MODEL_DIR = "models/Qwen3.5-0.8B"  # Databricks: "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
+DEVICE = "mps"  # Databricks: "cuda"
 
 # Cache configurations to compare, one row each in the output table.
-# INCLUDE_BASELINE adds the fp16 (uncompressed) row; BITS entries resolve via
-# FibQuantSpec.from_bits (d=256, k=4); SPEC_PATHS are explicit checkpoints.
+# INCLUDE_BASELINE adds the fp16 (uncompressed) row; SPEC_PATHS are explicit
+# spec checkpoints; BITS entries resolve via FibQuantSpec.from_bits (d=256,
+# k=4), which uses a *repo-relative* default path -- so on Databricks leave
+# BITS empty and list the volume checkpoints in SPEC_PATHS.
 INCLUDE_BASELINE = True
-BITS = [2, 3]  # e.g. [2], [2, 3, 4], or []
-SPEC_PATHS = []  # e.g. ["models/fibquant/fibquant_d256_k4_N4096.pt"]
+BITS = []  # e.g. [2], [2, 3, 4] -- use [] when SPEC_PATHS is set
+SPEC_PATHS = [
+    "models/fibquant/fibquant_d256_k4_N256.pt",
+    "models/fibquant/fibquant_d256_k4_N4096.pt",
+]  # Databricks: ["/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt", "..."]
 
 TRIALS = 10  # trials per depth
 DEPTHS = [256, 512, 1024, 2048, 4096]  # marker-to-query token distances

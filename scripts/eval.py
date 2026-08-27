@@ -16,8 +16,11 @@ import logging
 import sys
 from pathlib import Path
 
-# Make the repo root importable even when run as "python scripts/foo.py".
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Make the repo root importable when run as "python scripts/foo.py". In a
+# Databricks notebook __file__ is undefined (NameError); the notebook's
+# directory is already on sys.path there, so skip the insert.
+if "__file__" in globals():
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 
