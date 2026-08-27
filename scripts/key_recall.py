@@ -5,7 +5,9 @@ cache configuration (bf16 baseline + one row per FibQuant spec), the model
 must recall a marker token placed `depth` tokens earlier. The same
 deterministic filler windows are reused across configurations, so the cache
 is the only variable; greedy decode, success = the marker appears in the
-continuation. Batching by depth keeps it cheap: no thinking traces
+continuation. Filler is template-generated unique sentences (seeded per depth
+and trial), so the background is diverse -- never a repeating passage. Batching
+by depth keeps it cheap: no thinking traces
 (enable_thinking=False; the default thinking mode is what makes IFEval take
 ~5h on MPS) and short generations.
 
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -66,30 +69,74 @@ OUT = None  # write JSON results here, or None to only print the table
 
 SYSTEM_PROMPT = "You answer in one short phrase, nothing else."
 
-# Varied prose, tokenized once and sliced as filler. Marker word must not appear.
-CORPUS = """The cat sat on the mat and watched the birds beyond the window. A dog
-barked at the moon while seven stars shone over the quiet hills. Rain fell
-softly on the rooftops of the old town, and the streets glistened under the
-lamps. Farmers loaded their carts at dawn, heading toward the distant market.
-The river carried leaves downstream past the mill and the weathered bridge.
-Children played in the orchard, chasing butterflies through the tall grass.
-Cooks stirred a large pot of stew in the kitchen, where the fire crackled
-warmly. Trains crossed the plains under a pale blue sky, carrying letters and
-parcels between the cities. Sailors mended their nets on the wooden dock while
-gulls circled above the harbor. The librarian shelved books in the dim aisle,
-pausing to dust the spines of the old volumes. Winter came early that year,
-frosting the windows and silencing the gardens. The baker opened his shop
-before sunrise, filling the street with the smell of fresh bread. A musician
-played a slow tune in the square, and passersby paused to listen. The
-astronomer recorded the brightness of the comet from the hilltop observatory.
-The carpenter built a sturdy chest, fitting each joint with care. Green fields
-stretched to the horizon, dotted with sheep and lone oak trees. The ferry
-crossed the lake every hour, carrying passengers and bicycles. Smoke rose from
-the chimneys of the village, curling into the cold morning air."""
+# --- filler: template-generated unique sentences -------------------------
+# Every filler sentence is one template + iid slot words (no config, no files,
+# no repeating passages). Pool products make exact collisions astronomically
+# unlikely; a per-build `used` set makes it impossible regardless. The marker
+# word and anything containing it are absent from the pools by construction,
+# and the generated sentence is decode-verified before use.
+SENTENCE_TEMPLATES = [
+    "The {animal} {verb} through the {place} {when}.",
+    "A {animal} {verb} {adv} near the {place}.",
+    "The {adj} {animal} {verb} {adv} {when}.",
+    "The {occupation} {verb} {adv} beside a {noun}.",
+    "A {occupation} {verb} through the {place} {when}.",
+    "The {adj} {occupation} examined a {noun} {when}.",
+    "The {occupation} carried a {noun} across the {place}.",
+    "A {noun} {verb} {adv} on the {place} {when}.",
+    "The {adj} {noun} was {adv} visible {when}.",
+    "The {animal} watched the {adj} {noun} {when}.",
+    "A {noun} hung {adv} over the {place}.",
+    "The {adj} {occupation} saw a {noun} at the {place}.",
+    "Every {occupation} at the {place} owns a {noun}.",
+    "The {animal} hid {adv} behind the {noun} {when}.",
+]
+
+SENTENCE_POOLS = {
+    "animal": ["dog", "cat", "fox", "hawk", "heron", "otter", "badger", "lynx",
+               "eel", "newt", "crow", "seal", "wolf", "deer", "moose", "bison",
+               "gecko", "crane", "swan", "mole"],
+    "verb": ["wandered", "crept", "peered", "dashed", "drifted", "clambered",
+             "lingered", "scurried", "ambled", "soared", "trudged", "bounded",
+             "veered", "nestled", "vanished", "circled", "rested", "paced"],
+    "adv": ["quietly", "slowly", "steadily", "briefly", "softly", "gradually",
+            "warily", "eagerly", "haphazardly", "carefully", "awkwardly"],
+    "place": ["meadow", "harbor", "orchard", "courtyard", "thicket", "valley",
+              "station", "street", "rooftop", "corridor", "garden", "plateau",
+              "market", "tunnel", "attic", "promenade", "forest", "bridge"],
+    "noun": ["lantern", "ledger", "crate", "saddle", "hatbox", "map", "basket",
+             "kettle", "telescope", "compass", "bundle", "barrel", "mirror",
+             "whistle"],
+    "occupation": ["librarian", "baker", "blacksmith", "cartographer",
+                   "apothecary", "cartwright", "beekeeper", "clockmaker",
+                   "ferryman", "mason", "weaver", "oarsman", "lamplighter"],
+    "adj": ["weathered", "mottled", "sturdy", "curious", "weary", "faded",
+            "coiled", "glazed", "hollow", "bronze", "mossy", "threadbare"],
+    "when": ["at dusk", "before dawn", "in the rain", "under a thin moon",
+             "amid fog", "past midnight", "at first light", "in a stiff wind"],
+}
+
+_SLOT_RE = re.compile(r"\{(\w+)\}")
 
 
-def _repeat(seq, n):
-    return [seq[i % len(seq)] for i in range(n)]
+def _sentence(tokenizer: AutoTokenizer, rng: random.Random, marker: str, used: set[str]) -> list[int]:
+    """One fresh, unique, marker-free filler sentence as token ids.
+
+    Encoded with a leading space so the sentence-initial word is the *mid-text*
+    token variant (" A" != "A" in this BPE), keeping the concatenated filler
+    properly spaced at the token level.
+    """
+    for _ in range(100):
+        template = rng.choice(SENTENCE_TEMPLATES)
+        text = template.format(**{s: rng.choice(SENTENCE_POOLS[s]) for s in _SLOT_RE.findall(template)})
+        if text in used:
+            continue
+        ids = tokenizer.encode(" " + text, add_special_tokens=False)
+        if marker.lower() in tokenizer.decode(ids).lower():
+            continue
+        used.add(text)
+        return ids
+    raise ValueError("could not generate a unique marker-free filler sentence")
 
 
 def build_trials(
@@ -130,13 +177,14 @@ def build_trials(
     assert lcp > 0, "could not locate template splice point"
     assert f" {marker}" in tokenizer.decode(ids_short[:lcp]), "marker token not in shared template prefix"
 
-    corpus_ids = tokenizer.encode(CORPUS, add_special_tokens=False)
-    n = len(corpus_ids)
+    used: set[str] = set()
     rng = random.Random(seed + depth)  # same windows for every config
     rows = []
     for _ in range(trials):
-        start = rng.randrange(n)
-        filler = _repeat(corpus_ids[start:start + depth], depth) if depth else []
+        filler = []
+        while len(filler) < depth:
+            filler.extend(_sentence(tokenizer, rng, marker, used))
+        filler = filler[:depth]  # overshoot then trim to exactly `depth`
         rows.append(ids_short[:lcp] + filler + ids_full[lcp:])
     return torch.tensor(rows, dtype=torch.long)
 
