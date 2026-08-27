@@ -31,9 +31,21 @@ if "__file__" in globals():
 from fibquant import FibQuantCache, FibQuantRuntime, FibQuantSpec, decode, encode
 from fibquant.eval_harness import load_model
 
-MODEL_DIR = "models/Qwen3.5-0.8B"
-SPEC_PATH = "models/fibquant/fibquant_d256_k4_N256.pt"  # N256=b2, N4096=b3, N65536=b4
-DEVICE = "mps"  # "cuda" on Databricks
+# One switch: False = local repo layout (models/ in the repo, MPS). True =
+# the Databricks volume layout (GPU, model + checkpoints on a volume).
+DATABRICKS = False
+
+MODEL_DIR = (
+    "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
+    if DATABRICKS
+    else "models/Qwen3.5-0.8B"
+)
+SPEC_PATH = (
+    "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt"
+    if DATABRICKS
+    else "models/fibquant/fibquant_d256_k4_N256.pt"
+)  # N256=b2, N4096=b3, N65536=b4
+DEVICE = "cuda" if DATABRICKS else "mps"
 
 
 def roundtrip(spec: FibQuantSpec) -> None:

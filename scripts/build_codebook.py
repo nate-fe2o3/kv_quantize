@@ -32,6 +32,10 @@ from fibquant import FibQuantSpec, build_codebook, build_rotation, spec_path
 from fibquant.scoring import min_pairwise_distance
 
 # --- build configuration --------------------------------------------------
+# One switch: False = local repo layout (OUT under repo models/fibquant).
+# True = the Databricks volume layout (OUT on the UC volume, next to models).
+DATABRICKS = False
+
 D = 256  # head dim
 K = 4  # block size
 N_LEVELS = 256  # codewords per block (b = log2(N) / k bits/coord)
@@ -40,7 +44,11 @@ RESTARTS = 4
 LLOYD_ITERS = 25
 M_FACTOR = 30  # samples per codeword (samples = M_FACTOR * N_LEVELS)
 SCORE_MB = 1024  # approx MB per (chunk, N) score matrix
-OUT = None  # output checkpoint path; None = default spec path
+OUT = (
+    f"/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d{D}_k{K}_N{N_LEVELS}.pt"
+    if DATABRICKS
+    else None  # repo-relative default spec path
+)
 
 
 def main() -> None:

@@ -27,22 +27,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(me
 from fibquant import FibQuantSpec
 from fibquant.eval_harness import EvalConfig, run_eval
 
-MODEL_DIR = "models/Qwen3.5-0.8B"
-DEVICE = "mps"  # "cuda" on Databricks
+# One switch: False = local repo layout (models/ in the repo, MPS,
+# repo-relative spec default). True = the Databricks volume layout (GPU, model
+# and checkpoints on the volume, spec derived from BITS against the volume).
+DATABRICKS = False
+
+MODEL_DIR = (
+    "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
+    if DATABRICKS
+    else "models/Qwen3.5-0.8B"
+)
+DEVICE = "cuda" if DATABRICKS else "mps"
 
 # --- quantization width --------------------------------------------------
 BITS = 2  # bits/coordinate: 2, 3, or 4 (the codebook checkpoint must exist)
 FIBQUANT_K = 4
 FIBQUANT_D = 256
 
-# Explicit spec checkpoint overrides the derived default (e.g. for a nonstandard
-# k); None = models/fibquant/fibquant_d{D}_k{K}_N{1 << (BITS * K)}.pt
-SPEC_PATH = None
+# Explicit spec checkpoint overrides the derived default (for a nonstandard k);
+# None = repo-relative default. On Databricks it must be explicit (volume).
+SPEC_PATH = (
+    f"/Volumes/security_engineering/nbutton/q34b/models/fibquant/"
+    f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{1 << (BITS * FIBQUANT_K)}.pt"
+    if DATABRICKS
+    else None
+)
 ENABLE_FIBQUANT = True
 
 # --- run configuration ---------------------------------------------------
 TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"  # output subdirectory under OUTPUT_DIR
-OUTPUT_DIR = "results/qwen3.5-0.8b"
+OUTPUT_DIR = (
+    "/Volumes/security_engineering/nbutton/q34b/results/qwen3.5-0.8b"
+    if DATABRICKS
+    else "results/qwen3.5-0.8b"
+)
 TASKS = ["hellaswag", "wikitext"]
 LIMIT = None  # eval limit (testing only)
 BATCH_SIZE = 8

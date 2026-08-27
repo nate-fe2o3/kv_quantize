@@ -38,29 +38,45 @@ if "__file__" in globals():
 from fibquant import FibQuantCache, FibQuantSpec  # noqa: E402
 from fibquant.eval_harness import load_model  # noqa: E402
 
+# --- environment layout --------------------------------------------------
+# One switch: False = local repo layout (models/ in the repo, MPS). True =
+# the Databricks volume layout (GPU, model + codebook checkpoints on a volume).
+DATABRICKS = False
+
 # --- run configuration ---------------------------------------------------
-MODEL_DIR = "models/Qwen3.5-0.8B"  # Databricks: "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
-DEVICE = "mps"  # Databricks: "cuda"
+MODEL_DIR = (
+    "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
+    if DATABRICKS
+    else "models/Qwen3.5-0.8B"
+)
+DEVICE = "cuda" if DATABRICKS else "mps"
 
 # Cache configurations to compare, one row each in the output table.
 # INCLUDE_BASELINE adds the fp16 (uncompressed) row; SPEC_PATHS are explicit
 # spec checkpoints; BITS entries resolve via FibQuantSpec.from_bits (d=256,
-# k=4), which uses a *repo-relative* default path -- so on Databricks leave
-# BITS empty and list the volume checkpoints in SPEC_PATHS.
+# k=4), which uses a *repo-relative* default path -- so leave BITS empty on
+# Databricks (checkpoints are on the volume) and list them in SPEC_PATHS.
 INCLUDE_BASELINE = True
 BITS = []  # e.g. [2], [2, 3, 4] -- use [] when SPEC_PATHS is set
-SPEC_PATHS = [
-    "models/fibquant/fibquant_d256_k4_N256.pt",
-    "models/fibquant/fibquant_d256_k4_N4096.pt",
-]  # Databricks: ["/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt", "..."]
+SPEC_PATHS = (
+    [
+        "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt",
+        "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N4096.pt",
+    ]
+    if DATABRICKS
+    else [
+        "models/fibquant/fibquant_d256_k4_N256.pt",
+        "models/fibquant/fibquant_d256_k4_N4096.pt",
+    ]
+)
 
-TRIALS = 10  # trials per depth
+TRIALS = 50  # trials per depth
 # Trials are batched into generate() calls of this size; peak activation
 # memory scales with batch * seq^2 (attention scores), so 30 x 4096 in one
 # call OOMs. 10 matches the memory of the earlier 10-trial runs; lower to 5
 # if a long depth still OOMs, raise if the GPU has headroom.
 TRIAL_BATCH = 10
-DEPTHS = [256, 512, 1024, 2048, 4096]  # marker-to-query token distances
+DEPTHS = [1024, 2048, 4096]  # marker-to-query token distances
 MAX_LENGTH = 4096  # cap on total prompt length (filler is truncated)
 MAX_NEW_TOKENS = 12  # generated tokens per trial
 MARKER = "rabbit"  # recall marker word
@@ -243,8 +259,14 @@ def main() -> None:
 
     if len(tokenizer.encode(MARKER)) != 1 or len(tokenizer.encode(f" {MARKER}")) != 1:
         raise ValueError(f"MARKER {MARKER!r} is not a single token in context; pick another word")
-    if MARKER.lower() in CORPUS.lower():
-        raise ValueError("MARKER must not appear in the filler corpus")
+    # Filler invariant (replaces the old CORPUS check): the marker word must not
+    # be reachable from the pools -- _sentence re-verifies each generated
+    # sentence, but fail at startup if a pool edit introduces it.
+    marker_l = MARKER.lower()
+    for _slot, _words in SENTENCE_POOLS.items():
+        for _w in _words:
+            if marker_l in _w.lower():
+                raise ValueError(f"MARKER {MARKER!r} appears in filler pool '{_slot}' as {_w!r}")
 
     config_text = model.config.text_config
     max_depth = MAX_LENGTH - 16

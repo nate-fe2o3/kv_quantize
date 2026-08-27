@@ -52,6 +52,10 @@ FIBQUANT_K = 4  # coordinates per codebook block
 FIBQUANT_D = 256  # per-head key/value dim
 
 # --- environment layout --------------------------------------------------
+# One switch: True = the Databricks volume layout (GPU, model + checkpoints
+# on the UC volume). False = local repo layout (models/ in the repo).
+DATABRICKS = True
+
 # A Databricks notebook's CWD is not the repo root, so relative paths like
 # models/... don't resolve. Set REPO_ROOT to wherever the repo code lives,
 # e.g. "/Workspace/Users/<user>/kv_quantize". Required on serverless (fibquant
@@ -59,11 +63,11 @@ FIBQUANT_D = 256  # per-head key/value dim
 # importable fibquant package (works locally and on classic clusters).
 REPO_ROOT = None
 
-# Checkpoints (models/) are gitignored, so a Databricks git folder never
-# contains them. Upload models/ to DBFS or a UC volume and point MODELS_DIR
-# at it, e.g. "/dbfs/FileStore/kv_quantize/models" or
-# "/Volumes/<catalog>/<schema>/<volume>/models". None = <repo>/models.
-MODELS_DIR = None
+MODELS_DIR = (
+    "/Volumes/security_engineering/nbutton/q34b/models"
+    if DATABRICKS
+    else None  # <repo>/models
+)
 
 
 def _resolve_repo_root() -> Path:
@@ -87,7 +91,11 @@ MODEL_DIR = str(_MODELS_DIR / "Qwen3.5-0.8B")
 SPEC_PATH = str(_MODELS_DIR / "fibquant" / f"fibquant_d{FIBQUANT_D}_k{FIBQUANT_K}_N{1 << (BITS * FIBQUANT_K)}.pt")
 ENABLE_FIBQUANT = True
 TAG = f"fibquant-b{BITS}" if ENABLE_FIBQUANT else "baseline"
-OUTPUT_DIR = "results/qwen3.5-0.8b"
+OUTPUT_DIR = (
+    "/Volumes/security_engineering/nbutton/q34b/results/qwen3.5-0.8b"
+    if DATABRICKS
+    else "results/qwen3.5-0.8b"
+)
 TASKS = ["hellaswag", "wikitext"]
 BATCH_SIZE = "auto"
 MAX_LENGTH = 2048
