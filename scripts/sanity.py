@@ -1,9 +1,8 @@
 """Sanity checks for the FibQuant cache on Qwen3.5-0.8B.
 
-Configure via the constants below and run the file directly — no CLI
-arguments:
-
-    .venv/bin/python scripts/sanity.py
+Databricks-only (model and codebook checkpoints live on the UC volume); run as
+a notebook or `python scripts/sanity.py` on the cluster. Configure via the
+constants below — no CLI arguments.
 
 1. Roundtrip: encode/decode random Gaussian vectors, report cosine similarity.
 2. Logits: fp16 baseline vs FibQuant (per SPEC_PATH) on a fixed prompt,
@@ -11,41 +10,22 @@ arguments:
 3. Memory: persistent stored bytes per full-attention layer vs fp16.
 
 Model loading goes through fibquant.eval_harness.load_model (single home for
-the MPS single-worker fix).
+model-loading fixes).
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 from transformers import AutoTokenizer, DynamicCache
-
-# Make the repo root importable when run as "python scripts/foo.py". In a
-# Databricks notebook __file__ is undefined (NameError); the notebook's
-# directory is already on sys.path there, so skip the insert.
-if "__file__" in globals():
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fibquant import FibQuantCache, FibQuantRuntime, FibQuantSpec, decode, encode
 from fibquant.eval_harness import load_model
 
-# One switch: False = local repo layout (models/ in the repo, MPS). True =
-# the Databricks volume layout (GPU, model + checkpoints on a volume).
-DATABRICKS = False
-
-MODEL_DIR = (
-    "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
-    if DATABRICKS
-    else "models/Qwen3.5-0.8B"
-)
-SPEC_PATH = (
-    "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt"
-    if DATABRICKS
-    else "models/fibquant/fibquant_d256_k4_N256.pt"
-)  # N256=b2, N4096=b3, N65536=b4
-DEVICE = "cuda" if DATABRICKS else "mps"
+# --- paths (Databricks volume layout) ------------------------------------
+MODEL_DIR = "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
+SPEC_PATH = "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt"
+# N256=b2, N4096=b3, N65536=b4
+DEVICE = "cuda"
 
 
 def roundtrip(spec: FibQuantSpec) -> None:

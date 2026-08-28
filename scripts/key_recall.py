@@ -9,12 +9,11 @@ continuation. Filler is template-generated unique sentences (seeded per depth
 and trial), so the background is diverse -- never a repeating passage. Batching
 by depth keeps it cheap: no thinking traces
 (enable_thinking=False; the default thinking mode is what makes IFEval take
-~5h on MPS) and short generations.
+~5h) and short generations.
 
-Configure via the constants below and run the file directly — no CLI
-arguments:
-
-    .venv/bin/python scripts/key_recall.py
+Databricks-only (model and codebook checkpoints live on the UC volume); run as
+a notebook or `python scripts/key_recall.py` on the cluster. Configure via the
+constants below — no CLI arguments.
 """
 
 from __future__ import annotations
@@ -22,59 +21,37 @@ from __future__ import annotations
 import json
 import random
 import re
-import sys
 import time
 from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
 
-# Make the repo root importable when run as "python scripts/foo.py". In a
-# Databricks notebook __file__ is undefined (NameError); the notebook's
-# directory is already on sys.path there, so skip the insert.
-if "__file__" in globals():
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fibquant import FibQuantCache, FibQuantSpec
+from fibquant.eval_harness import load_model
 
-from fibquant import FibQuantCache, FibQuantSpec  # noqa: E402
-from fibquant.eval_harness import load_model  # noqa: E402
-
-# --- environment layout --------------------------------------------------
-# One switch: False = local repo layout (models/ in the repo, MPS). True =
-# the Databricks volume layout (GPU, model + codebook checkpoints on a volume).
-DATABRICKS = False
+# --- paths (Databricks volume layout) ------------------------------------
+MODEL_DIR = "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
+DEVICE = "cuda"
 
 # --- run configuration ---------------------------------------------------
-MODEL_DIR = (
-    "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
-    if DATABRICKS
-    else "models/Qwen3.5-0.8B"
-)
-DEVICE = "cuda" if DATABRICKS else "mps"
-
 # Cache configurations to compare, one row each in the output table.
 # INCLUDE_BASELINE adds the fp16 (uncompressed) row; SPEC_PATHS are explicit
 # spec checkpoints; BITS entries resolve via FibQuantSpec.from_bits (d=256,
-# k=4), which uses a *repo-relative* default path -- so leave BITS empty on
-# Databricks (checkpoints are on the volume) and list them in SPEC_PATHS.
+# k=4), which uses a *repo-relative* default path that does not exist here --
+# keep BITS empty and list the volume checkpoints in SPEC_PATHS.
 INCLUDE_BASELINE = True
-BITS = []  # e.g. [2], [2, 3, 4] -- use [] when SPEC_PATHS is set
-SPEC_PATHS = (
-    [
-        "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt",
-        "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N4096.pt",
-    ]
-    if DATABRICKS
-    else [
-        "models/fibquant/fibquant_d256_k4_N256.pt",
-        "models/fibquant/fibquant_d256_k4_N4096.pt",
-    ]
-)
+BITS = []  # e.g. [2, 3, 4] -- keep [] and use SPEC_PATHS
+SPEC_PATHS = [
+    "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N256.pt",
+    "/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d256_k4_N4096.pt",
+]
 
 TRIALS = 50  # trials per depth
 # Trials are batched into generate() calls of this size; peak activation
 # memory scales with batch * seq^2 (attention scores), so 30 x 4096 in one
-# call OOMs. 10 matches the memory of the earlier 10-trial runs; lower to 5
-# if a long depth still OOMs, raise if the GPU has headroom.
+# call OOMs. Lower to 5 if a long depth still OOMs, raise if the GPU has
+# headroom.
 TRIAL_BATCH = 10
 DEPTHS = [1024, 2048, 4096]  # marker-to-query token distances
 MAX_LENGTH = 4096  # cap on total prompt length (filler is truncated)
@@ -259,9 +236,9 @@ def main() -> None:
 
     if len(tokenizer.encode(MARKER)) != 1 or len(tokenizer.encode(f" {MARKER}")) != 1:
         raise ValueError(f"MARKER {MARKER!r} is not a single token in context; pick another word")
-    # Filler invariant (replaces the old CORPUS check): the marker word must not
-    # be reachable from the pools -- _sentence re-verifies each generated
-    # sentence, but fail at startup if a pool edit introduces it.
+    # Filler invariant: the marker word must not be reachable from the pools --
+    # _sentence re-verifies each generated sentence, but fail at startup if a
+    # pool edit introduces it.
     marker_l = MARKER.lower()
     for _slot, _words in SENTENCE_POOLS.items():
         for _w in _words:

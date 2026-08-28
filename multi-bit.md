@@ -159,7 +159,7 @@ Recommendation: (a) now, (b) later if needed.
 None of these crash; they quietly evaluate the wrong config when `--spec` is
 forgotten:
 
-- `scripts/eval.py:69-70` and `scripts/eval_cuda.py:71-72` — `--spec` defaults to
+- `scripts/eval_cuda.py` — `--spec` defaults to
   `models/fibquant/fibquant_d256_k4_N256.pt`; help text says "FibQuant b=2".
 - `scripts/sanity.py:103` — same hardcoded default.
 - `fibquant/cache.py:5-6` module docstring ("~8x at b=2"), `cache.py:56`
@@ -203,7 +203,7 @@ docstrings to say "one packed/unpacked container element per k-block".
 ```bash
 .venv/bin/python scripts/build_codebook.py    # N_LEVELS = 65536 for b=4
 .venv/bin/python scripts/sanity.py            # SPEC_PATH = ...N65536.pt
-.venv/bin/python scripts/eval.py              # BITS = 4 (TAG derived), TASKS as wanted
+.venv/bin/python scripts/eval_cuda.py          # BITS = 4 (TAG derived), TASKS as wanted
 
 .venv/bin/python scripts/build_codebook.py    # N_LEVELS = 4096 for b=3 (see issue 3)
 .venv/bin/python scripts/sanity.py            # SPEC_PATH = ...N4096.pt
@@ -222,3 +222,50 @@ change, no packing waste), and b=3 as k=2, N=64 (6-bit index in uint8, 25% waste
 This dodges issues 1 and 3 entirely at the cost of weaker 2-D codebooks; the
 FibQuant design point is k=4, so prefer the k=4 + uint16 route for comparable
 results, but k=2 is a useful cross-check if the uint16 path misbehaves.
+
+---
+
+## Eval evidence: recall probe verdict on b=3 vs b=2 (2026-08)
+
+`scripts/key_recall.py` — needle-in-haystack for KV fidelity. Model: Qwen3.5-0.8B
+(6 full-attn layers, 2 KV heads). One marker token ("rabbit") placed `depth`
+tokens before the query; filler drawn deterministically per (seed, depth) and
+reused verbatim across configurations, so the cache is the only variable; greedy
+decode, 12 new tokens, success = marker appears in the continuation. Configs:
+baseline (fp16 KV), fq-N256 = b=2 (7.8x), fq-N4096 = b=3 packed (5.2x).
+
+**Filler must be unique sentences.** The original probe cycled an ~250-token
+prose section as filler. Under that filler, recall appeared to degrade with
+depth (fq-N256: 92/84/84/80 at 2048/4096/8192/16368; 70% at 4080 in a 50-trial
+run). After switching to template-generated unique sentences (no repeating
+text anywhere), the depth slide disappeared entirely and the numbers jumped:
+fq-N256 at 4080 went from 70% → 94%, while shallow depths (1024/2048) barely
+moved. Attribution: softmax attention mass aggregates over repeated content —
+at 4080 tokens the corpus cycled ~15x, so every filler token accumulated ~15x
+the attention mass of the singleton needle; small quantization noise then let
+the aggregate beat the needle. The old depth curves measured the *repetition
+artifact*, not KV fidelity at long range.
+
+**Pooled soup-filler results** (300 trials/config, depths 1024-16368, identical
+trial inputs across configs so comparisons are paired):
+
+| config | misses / 300 | recall | note |
+|--------|--------------|--------|------|
+| baseline    | 0 | 100%      | 95% one-sided lower bound ~99% |
+| fq-N4096    | 0 | 100%      | same bound; no deficit this probe can detect |
+| fq-N256     | 16 | 94.7%     | 16 discordant pairs vs baseline, 0 reverse → p ≈ 1.5e-5; not noise |
+
+The fq-N256 miss rate is flat across depth (6/4/3 misses at 1024/2048/4080 then
+2/0/1 at 4096/8192/16368) — a constant ~5% fidelity tax from 2 bits/coord, not
+a long-range slide. fq-N4096 shows zero measurable cost out to 16k context.
+
+**Verdict:** ship b=3 packed (5.2x) as the default operating point. b=2 (7.8x)
+is a real but constant ~5% per-retrieval tax, worth paying only if memory-bound
+beyond what b=3 gives (b=3 ≈ 75 MB vs b=2 ≈ 50 MB at 32k; ≈ 300 vs ≈ 200 MB at
+128k). Caveat: the probe is deliberately easy — marker sits at a fixed position
+adjacent to the system prompt, singleton word, short greedy generation — so it
+bounds *singleton retrieval* fidelity but says nothing yet about buried
+needles, multi-token reproduction, many-position integration, or compounding
+across turns — those are covered by `scripts/multi_needle.py` (buried,
+multi-needle recall) and `scripts/logit_kl.py` (per-position KL and top-1
+agreement vs fp16 KV at 4k-16k).

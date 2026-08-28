@@ -1,9 +1,8 @@
 """Build and save the shared FibQuant codebook + rotation matrix.
 
-Configure via the constants below and run the file directly — no CLI
-arguments:
-
-    .venv/bin/python scripts/build_codebook.py
+Databricks-only (checkpoints are written to the UC volume next to the model
+checkpoints); run as a notebook or `python scripts/build_codebook.py` on the
+cluster. Configure via the constants below — no CLI arguments.
 
 Default: d=256 (Qwen3.5 full-attn head dim), k=4, N=256 -> b=2 bits/coord.
 Higher-fidelity operating points: N_LEVELS=4096 (b=3) or N_LEVELS=65536
@@ -17,25 +16,12 @@ build's.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 
-# Make the repo root importable when run as "python scripts/foo.py". In a
-# Databricks notebook __file__ is undefined (NameError); the notebook's
-# directory is already on sys.path there, so skip the insert.
-if "__file__" in globals():
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from fibquant import FibQuantSpec, build_codebook, build_rotation, spec_path
+from fibquant import FibQuantSpec, build_codebook, build_rotation
 from fibquant.scoring import min_pairwise_distance
 
 # --- build configuration --------------------------------------------------
-# One switch: False = local repo layout (OUT under repo models/fibquant).
-# True = the Databricks volume layout (OUT on the UC volume, next to models).
-DATABRICKS = False
-
 D = 256  # head dim
 K = 4  # block size
 N_LEVELS = 256  # codewords per block (b = log2(N) / k bits/coord)
@@ -44,11 +30,7 @@ RESTARTS = 4
 LLOYD_ITERS = 25
 M_FACTOR = 30  # samples per codeword (samples = M_FACTOR * N_LEVELS)
 SCORE_MB = 1024  # approx MB per (chunk, N) score matrix
-OUT = (
-    f"/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d{D}_k{K}_N{N_LEVELS}.pt"
-    if DATABRICKS
-    else None  # repo-relative default spec path
-)
+OUT = f"/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d{D}_k{K}_N{N_LEVELS}.pt"
 
 
 def main() -> None:
@@ -74,9 +56,8 @@ def main() -> None:
     dead_frac = dead / N_LEVELS
 
     mse = (codebook**2).mean().item()
-    out = OUT or str(spec_path(D, K, N_LEVELS))
     spec = FibQuantSpec(codebook=codebook, rotation=rotation, d=D, k=K, n_levels=N_LEVELS)
-    spec.save(out, seed=SEED, mse=mse)
+    spec.save(OUT, seed=SEED, mse=mse)
     print(f"codebook radius range: [{codebook.norm(dim=-1).min():.4f}, {codebook.norm(dim=-1).max():.4f}]")
     print(f"min pairwise codeword distance: {min_dists.min():.4f}, mean: {min_dists.mean():.4f}")
     print(f"codeword mean-squared norm: {mse:.4f}")
@@ -85,7 +66,7 @@ def main() -> None:
         print(
             "WARNING: >1% dead codewords -- consider a larger M_FACTOR or more LLOYD_ITERS"
         )
-    print(f"saved to {out}")
+    print(f"saved to {OUT}")
 
 
 if __name__ == "__main__":

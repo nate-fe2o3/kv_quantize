@@ -11,9 +11,9 @@ The harness owns every environment quirk a FibQuant eval has to work around:
     (`transformers.core_model_loading.GLOBAL_WORKERS = 1`) is applied by
     `load_model`, the single place models are loaded in this repo.
 
-`run_eval(EvalConfig)` is the interface: eval.py (CLI) and eval_cuda.py
-(Databricks notebook constants) are thin config objects; every other script
-loads models through `load_model`.
+`run_eval(EvalConfig)` is the interface: eval_cuda.py (Databricks notebook
+constants) is a thin config object; every other script loads models through
+`load_model`.
 """
 
 from __future__ import annotations
