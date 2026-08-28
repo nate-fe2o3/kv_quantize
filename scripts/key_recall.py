@@ -56,7 +56,7 @@ TRIAL_BATCH = 10
 DEPTHS = [1024, 2048, 4096]  # marker-to-query token distances
 MAX_LENGTH = 4096  # cap on total prompt length (filler is truncated)
 MAX_NEW_TOKENS = 12  # generated tokens per trial
-MARKER = "rabbit"  # recall marker word
+MARKER = "rabbit"  # recall marker (a word or a short phrase)
 SEED = 0
 OUT = None  # write JSON results here, or None to only print the table
 
@@ -110,6 +110,35 @@ SENTENCE_POOLS = {
 }
 
 _SLOT_RE = re.compile(r"\{(\w+)\}")
+
+
+def normalize_continuation(text: str) -> str:
+    """Lowercase and collapse whitespace before marker matching.
+
+    Multi-token markers are phrases, and the model may insert extra spaces or
+    line breaks between the words ("blue   whale") without forgetting them --
+    those must not count as recall misses. (A word glued mid-word --
+    "bluewhale" -- still does; keep markers to words/short phrases.) Kept in
+    sync with scripts/multi_needle.py.
+    """
+    return " ".join(text.lower().split())
+
+
+def validate_marker(marker: str, pools: dict[str, list[str]]) -> None:
+    """Startup invariants for one marker (raises ValueError).
+
+    Multi-token markers are allowed; the single-token rule was dropped. What
+    must hold: the marker is non-empty and not reachable from the filler
+    pools (a marker that can legitimately appear in filler breaks the test;
+    _sentence also re-verifies every generated sentence).
+    """
+    if not marker.strip():
+        raise ValueError(f"MARKER {marker!r} is empty/whitespace-only")
+    marker_l = marker.lower()
+    for slot, words in pools.items():
+        for w in words:
+            if marker_l in w.lower():
+                raise ValueError(f"MARKER {marker!r} appears in filler pool '{slot}' as {w!r}")
 
 
 def _sentence(tokenizer: AutoTokenizer, rng: random.Random, marker: str, used: set[str]) -> list[int]:
@@ -168,7 +197,7 @@ def build_trials(
     while lcp < min(len(ids_full), len(ids_short)) and ids_full[lcp] == ids_short[lcp]:
         lcp += 1
     assert lcp > 0, "could not locate template splice point"
-    assert f" {marker}" in tokenizer.decode(ids_short[:lcp]), "marker token not in shared template prefix"
+    assert f" {marker}" in tokenizer.decode(ids_short[:lcp]), "marker text not in shared template prefix"
 
     used: set[str] = set()
     rng = random.Random(seed + depth)  # same windows for every config
@@ -210,8 +239,8 @@ def run_config(
                     do_sample=False,
                     past_key_values=cache,
                 )
-                conts = [tokenizer.decode(row[chunk.shape[-1]:]) for row in out]
-                hits += sum(marker.lower() in c.lower() for c in conts)
+                conts = [normalize_continuation(tokenizer.decode(row[chunk.shape[-1]:])) for row in out]
+                hits += sum(marker in c for c in conts)  # conts are normalized (lowercased)
         results[depth] = hits / inputs.shape[0]
     return results
 
@@ -234,16 +263,11 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     model = load_model(MODEL_DIR, DEVICE)
 
-    if len(tokenizer.encode(MARKER)) != 1 or len(tokenizer.encode(f" {MARKER}")) != 1:
-        raise ValueError(f"MARKER {MARKER!r} is not a single token in context; pick another word")
-    # Filler invariant: the marker word must not be reachable from the pools --
+    # Filler invariant: the marker must not be reachable from the pools --
     # _sentence re-verifies each generated sentence, but fail at startup if a
-    # pool edit introduces it.
-    marker_l = MARKER.lower()
-    for _slot, _words in SENTENCE_POOLS.items():
-        for _w in _words:
-            if marker_l in _w.lower():
-                raise ValueError(f"MARKER {MARKER!r} appears in filler pool '{_slot}' as {_w!r}")
+    # pool edit introduces it. Single-token-ness is NOT required: multi-token
+    # markers are supported (see normalize_continuation).
+    validate_marker(MARKER, SENTENCE_POOLS)
 
     config_text = model.config.text_config
     max_depth = MAX_LENGTH - 16

@@ -58,9 +58,13 @@ TRIAL_BATCH = 4  # peak activation memory scales batch * seq^2; 4 at 16k
 DEPTHS = [4096, 8192, 16384]  # total tokens before the query (filler + needles)
 MAX_LENGTH = 16384  # cap on filler; DEPTHS entries are clamped like key_recall
 MAX_NEW_TOKENS = 24  # enough to list up to 5 markers
-MARKERS = ["rabbit", "whale", "sable", "lark", "wren"]  # one word per needle (len(MARKERS) needles);
-# each must be a single token and absent from the pools (single-token failures
-# are caught at startup -- swap the offending word)
+MARKERS = ["rabbit", "whale", "sable", "lark", "wren"]  # one marker per needle (len(MARKERS) needles);
+# Markers may be multi-token words or short phrases: they are spliced in as
+# " " + frame and matched against the whitespace-normalized continuation.
+# Only empty markers, self-overlapping markers, or text reachable from the
+# filler pools fail at startup (see validate_markers). Prefer words over long
+# phrases: a phrase can be glued mid-word by the tokenizer ("blue whale" ->
+# "bluewhale") and then score as a miss even when the model recalled it.
 # Needle geometry (tokens, relative to the start of the user message):
 NEEDLE_MIN_POS = 1024  # at least this much filler before the first needle
 NEEDLE_MIN_TAIL = 1024  # at least this much filler after the last needle
@@ -117,6 +121,40 @@ SENTENCE_POOLS = {
 }
 
 _SLOT_RE = re.compile(r"\{(\w+)\}")
+
+
+def normalize_continuation(text: str) -> str:
+    """Lowercase and collapse whitespace before marker matching.
+
+    Multi-token markers are phrases, and the model may insert extra spaces or
+    line breaks between the words ("blue   whale") without forgetting them --
+    those must not count as recall misses. (A word glued mid-word --
+    "bluewhale" -- still does; see the MARKERS comment for why short
+    markers are safer.)
+    """
+    return " ".join(text.lower().split())
+
+
+def validate_markers(markers: list[str], pools: dict[str, list[str]]) -> None:
+    """Startup invariants for marker phrases (raises ValueError).
+
+    Multi-token markers are allowed; the single-token rule was dropped. What
+    must hold: markers are non-empty; no marker is a substring of another
+    marker (self-overlap makes hits unassignable); no marker text is
+    reachable from the filler pools (a marker that can legitimately appear in
+    filler breaks the test; _sentence also re-verifies every sentence).
+    """
+    marker_ls = [m.lower() for m in markers]
+    for m, m_l in zip(markers, marker_ls):
+        if not m_l.strip():
+            raise ValueError(f"MARKER {m!r} is empty/whitespace-only")
+        for other in marker_ls:
+            if other != m_l and other in m_l:
+                raise ValueError(f"MARKER {m!r} overlaps another marker ({other!r}); use non-substring words")
+        for slot, words in pools.items():
+            for w in words:
+                if m_l in w.lower():
+                    raise ValueError(f"MARKER {m!r} appears in filler pool '{slot}' as {w!r}")
 
 
 def _sentence(
@@ -237,7 +275,7 @@ def build_trials(
     first = rows[0]
     content_len = len(first) - len(prefix) - len(suffix)
     assert depth - 2 <= content_len <= depth + 1, f"content length {content_len} off depth {depth}"
-    dec = tokenizer.decode(first).lower()
+    dec = normalize_continuation(tokenizer.decode(first))
     for m in markers:
         assert m.lower() in dec, f"marker {m!r} missing from trial 0; check MARKERS/tokenizer"
     assert "special token" in dec, "query text missing from trial 0"
@@ -278,7 +316,7 @@ def run_config(
                     do_sample=False,
                     past_key_values=cache,
                 )
-                conts = [tokenizer.decode(row[chunk.shape[-1]:]).lower() for row in out]
+                conts = [normalize_continuation(tokenizer.decode(row[chunk.shape[-1]:])) for row in out]
                 for c in conts:
                     got = [m.lower() in c for m in markers]
                     if all(got):
@@ -311,20 +349,10 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     model = load_model(MODEL_DIR, DEVICE)
 
-    # Marker invariants: single-token in context, mutually non-overlapping,
-    # and unreachable from the filler pools (= no marker is a substring of a
-    # pool word; _sentence also re-verifies every generated sentence).
-    marker_ls = [m.lower() for m in MARKERS]
-    for m, m_l in zip(MARKERS, marker_ls):
-        if len(tokenizer.encode(m)) != 1 or len(tokenizer.encode(f" {m}")) != 1:
-            raise ValueError(f"MARKER {m!r} is not a single token in context; pick another word")
-        for other in marker_ls:
-            if other != m_l and other in m_l:
-                raise ValueError(f"MARKER {m!r} overlaps another marker ({other!r}); use non-substring words")
-        for slot, words in SENTENCE_POOLS.items():
-            for w in words:
-                if m_l in w.lower():
-                    raise ValueError(f"MARKER {m!r} appears in filler pool '{slot}' as {w!r}")
+    # Marker invariants: non-empty, mutually non-overlapping, and unreachable
+    # from the filler pools. Single-token-ness is NOT required: multi-token
+    # markers are supported (see normalize_continuation).
+    validate_markers(MARKERS, SENTENCE_POOLS)
 
     config_text = model.config.text_config
     max_depth = MAX_LENGTH - 16
