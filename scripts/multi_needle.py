@@ -57,7 +57,13 @@ TRIALS = 50  # trials per depth
 TRIAL_BATCH = 4  # peak activation memory scales batch * seq^2; 4 at 16k
 DEPTHS = [4096, 8192, 16384]  # total tokens before the query (filler + needles)
 MAX_LENGTH = 16384  # cap on filler; DEPTHS entries are clamped like key_recall
-MAX_NEW_TOKENS = 24  # enough to list up to 5 markers
+# Max generated tokens per trial. None = auto: the token cost of the verbose
+# marker listing + ANSWER_BUDGET_SLACK (see required_answer_tokens). With
+# multi-token markers a fixed small budget can cut the continuation off
+# mid-list, and a cut tail counts as forgotten markers -- a silent recall
+# underestimate.
+MAX_NEW_TOKENS = None
+ANSWER_BUDGET_SLACK = 16  # framing/prefix allowance beyond the marker list
 MARKERS = ["rabbit", "whale", "sable", "lark", "wren"]  # one marker per needle (len(MARKERS) needles);
 # Markers may be multi-token words or short phrases: they are spliced in as
 # " " + frame and matched against the whitespace-normalized continuation.
@@ -155,6 +161,23 @@ def validate_markers(markers: list[str], pools: dict[str, list[str]]) -> None:
             for w in words:
                 if m_l in w.lower():
                     raise ValueError(f"MARKER {m!r} appears in filler pool '{slot}' as {w!r}")
+
+
+def required_answer_tokens(
+    tokenizer: AutoTokenizer,
+    markers: list[str],
+    slack: int = ANSWER_BUDGET_SLACK,
+) -> int:
+    """Minimum generation budget for one trial: verbose listing + slack.
+
+    The model may echo each needle on its own line (" Special token: X." per
+    marker) instead of a compact list, so the budget is sized against that
+    per-line format. A smaller budget risks a silently truncated
+    continuation, and a cut tail counts as forgotten markers -- a recall
+    underestimate (see MAX_NEW_TOKENS).
+    """
+    verbose = "".join(f" Special token: {m}." for m in markers)
+    return len(tokenizer.encode(verbose, add_special_tokens=False)) + slack
 
 
 def _sentence(
@@ -353,13 +376,20 @@ def main() -> None:
     # from the filler pools. Single-token-ness is NOT required: multi-token
     # markers are supported (see normalize_continuation).
     validate_markers(MARKERS, SENTENCE_POOLS)
+    required = required_answer_tokens(tokenizer, MARKERS)
+    if MAX_NEW_TOKENS is not None and MAX_NEW_TOKENS < required:
+        raise ValueError(
+            f"MAX_NEW_TOKENS={MAX_NEW_TOKENS} below required {required} for MARKERS={MARKERS}; "
+            "raise it or set MAX_NEW_TOKENS=None (auto)"
+        )
+    max_new = required if MAX_NEW_TOKENS is None else MAX_NEW_TOKENS
 
     config_text = model.config.text_config
     max_depth = MAX_LENGTH - 16
     print(f"configs: {', '.join(name for name, _ in specs)}")
     print(
         f"trials={TRIALS} (batched {TRIAL_BATCH}) depths={DEPTHS} (filler capped at {max_depth} tokens) "
-        f"markers={MARKERS}"
+        f"markers={MARKERS} max_new={max_new}"
     )
     print(
         f"needles: buried in [{NEEDLE_MIN_POS}, depth-{NEEDLE_MIN_TAIL}], "
@@ -377,7 +407,7 @@ def main() -> None:
     for name, spec in specs:
         t0 = time.time()
         all_recall, per_marker = run_config(
-            model, tokenizer, inputs_by_depth, MARKERS, MAX_NEW_TOKENS, DEVICE, config_text, spec
+            model, tokenizer, inputs_by_depth, MARKERS, max_new, DEVICE, config_text, spec
         )
         table[name] = all_recall
         per_marker_table[name] = per_marker
@@ -392,7 +422,7 @@ def main() -> None:
     payload = {
         "markers": MARKERS,
         "trials": TRIALS,
-        "max_new_tokens": MAX_NEW_TOKENS,
+        "max_new_tokens": max_new,
         "needle_min_pos": NEEDLE_MIN_POS,
         "needle_min_tail": NEEDLE_MIN_TAIL,
         "needle_spacing": NEEDLE_SPACING,

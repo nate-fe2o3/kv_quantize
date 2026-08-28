@@ -13,15 +13,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.key_recall import (  # noqa: E402
+    ANSWER_BUDGET_SLACK as KR_SLACK,
     MARKER as KR_MARKER,
     SENTENCE_POOLS as KR_POOLS,
     normalize_continuation as kr_norm,
+    required_answer_tokens as kr_required,
     validate_marker as kr_validate,
 )
 from scripts.multi_needle import (  # noqa: E402
+    ANSWER_BUDGET_SLACK as MN_SLACK,
     MARKERS as MN_MARKERS,
     SENTENCE_POOLS as MN_POOLS,
     normalize_continuation as mn_norm,
+    required_answer_tokens as mn_required,
     validate_markers as mn_validate,
 )
 
@@ -65,6 +69,33 @@ def test_validate_markers_empty_rejected():
         mn_validate(["  "], MN_POOLS)
     with pytest.raises(ValueError, match="empty"):
         kr_validate("", KR_POOLS)
+
+
+class _WordsTok:
+    """Fake tokenizer: one token per whitespace-delimited word.
+
+    Enough to pin the answer-budget formula; real token counts differ but
+    the margin (verbose listing + slack) is what the startup check enforces.
+    """
+
+    def encode(self, text, add_special_tokens=False):
+        return list(range(len(text.split())))
+
+
+def test_required_answer_tokens_scales_with_marker_length():
+    tok = _WordsTok()
+    # Verbose per-line listing cost + slack (the format the model may echo).
+    assert mn_required(tok, ["rabbit"]) == len(" Special token: rabbit.".split()) + MN_SLACK
+    assert mn_required(tok, ["blue whale"]) == len(" Special token: blue whale.".split()) + MN_SLACK
+    two = len(" Special token: rabbit. Special token: blue whale.".split()) + MN_SLACK
+    assert mn_required(tok, ["rabbit", "blue whale"]) == two
+    # Multi-token markers raise the required budget: 5 phrases cost more than
+    # 5 single words.
+    five_words = mn_required(tok, ["a", "b", "c", "d", "e"])
+    five_phrases = mn_required(tok, ["a b", "c d", "e f", "g h", "i j"])
+    assert five_phrases > five_words
+    # key_recall: one marker, same formula with its own slack.
+    assert kr_required(tok, ["blue whale"]) == len(" Special token: blue whale.".split()) + KR_SLACK
 
 
 if __name__ == "__main__":

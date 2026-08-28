@@ -55,7 +55,8 @@ TRIALS = 50  # trials per depth
 TRIAL_BATCH = 10
 DEPTHS = [1024, 2048, 4096]  # marker-to-query token distances
 MAX_LENGTH = 4096  # cap on total prompt length (filler is truncated)
-MAX_NEW_TOKENS = 12  # generated tokens per trial
+MAX_NEW_TOKENS = None  # generated tokens per trial; None = auto (verbose marker + ANSWER_BUDGET_SLACK)
+ANSWER_BUDGET_SLACK = 12  # framing/prefix allowance beyond the marker itself
 MARKER = "rabbit"  # recall marker (a word or a short phrase)
 SEED = 0
 OUT = None  # write JSON results here, or None to only print the table
@@ -139,6 +140,22 @@ def validate_marker(marker: str, pools: dict[str, list[str]]) -> None:
         for w in words:
             if marker_l in w.lower():
                 raise ValueError(f"MARKER {marker!r} appears in filler pool '{slot}' as {w!r}")
+
+
+def required_answer_tokens(
+    tokenizer: AutoTokenizer,
+    marker: str,
+    slack: int = ANSWER_BUDGET_SLACK,
+) -> int:
+    """Minimum generation budget for one trial: verbose marker + slack.
+
+    The model may answer with full framing ("Special token: blue whale.")
+    rather than the bare word; the budget is sized against that. A smaller
+    budget risks a truncated continuation, which counts as a recall miss --
+    an underestimate (see MAX_NEW_TOKENS). Kept in sync with
+    scripts/multi_needle.py.
+    """
+    return len(tokenizer.encode(f" Special token: {marker}.", add_special_tokens=False)) + slack
 
 
 def _sentence(tokenizer: AutoTokenizer, rng: random.Random, marker: str, used: set[str]) -> list[int]:
@@ -268,11 +285,18 @@ def main() -> None:
     # pool edit introduces it. Single-token-ness is NOT required: multi-token
     # markers are supported (see normalize_continuation).
     validate_marker(MARKER, SENTENCE_POOLS)
+    required = required_answer_tokens(tokenizer, MARKER)
+    if MAX_NEW_TOKENS is not None and MAX_NEW_TOKENS < required:
+        raise ValueError(
+            f"MAX_NEW_TOKENS={MAX_NEW_TOKENS} below required {required} for MARKER={MARKER!r}; "
+            "raise it or set MAX_NEW_TOKENS=None (auto)"
+        )
+    max_new = required if MAX_NEW_TOKENS is None else MAX_NEW_TOKENS
 
     config_text = model.config.text_config
     max_depth = MAX_LENGTH - 16
     print(f"configs: {', '.join(name for name, _ in specs)}")
-    print(f"trials={TRIALS} (batched {TRIAL_BATCH}) depths={DEPTHS} (filler capped at {max_depth} tokens) marker={MARKER!r}")
+    print(f"trials={TRIALS} (batched {TRIAL_BATCH}) depths={DEPTHS} (filler capped at {max_depth} tokens) marker={MARKER!r} max_new={max_new}")
 
     # Build trial inputs once, reused for every config (same contexts, only cache differs).
     inputs_by_depth: dict[int, torch.Tensor] = {}
@@ -284,7 +308,7 @@ def main() -> None:
     for name, spec in specs:
         t0 = time.time()
         table[name] = run_config(
-            model, tokenizer, inputs_by_depth, MARKER, MAX_NEW_TOKENS, DEVICE, config_text, spec
+            model, tokenizer, inputs_by_depth, MARKER, max_new, DEVICE, config_text, spec
         )
         print(f"[{name}] done in {time.time() - t0:.0f}s")
 
@@ -297,7 +321,7 @@ def main() -> None:
     payload = {
         "marker": MARKER,
         "trials": TRIALS,
-        "max_new_tokens": MAX_NEW_TOKENS,
+        "max_new_tokens": max_new,
         "seed": SEED,
         "recall": {name: {str(d): table[name][d] for d in table[name]} for name, _ in specs},
     }
