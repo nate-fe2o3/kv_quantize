@@ -12,14 +12,22 @@ codebook size (see fibquant.quantize.index_dtype).
 Codebook quality diagnostics (min pairwise distance, dead-codeword fraction)
 come from the shared scorer module, so their chunking heuristic matches the
 build's.
+
+DEVICE selects where build_codebook trains (generators, samples, and Lloyd-Max
+accumulators all live there -- see fibquant.codebook); it defaults to "cpu"
+and switches to "cuda" automatically when available (e.g. a Databricks GPU
+cluster), so the same script trains on CPU or GPU without edits. The saved
+checkpoint always holds CPU tensors (spec.save below moves them back), so it
+loads on any machine regardless of what trained it.
 """
 
 from __future__ import annotations
 
 import torch
 
-from fibquant import FibQuantSpec, build_codebook, build_rotation
+from fibquant.codebook import build_codebook, build_rotation
 from fibquant.scoring import min_pairwise_distance
+from fibquant.spec import FibQuantSpec
 
 # --- build configuration --------------------------------------------------
 D = 256  # head dim
@@ -30,15 +38,16 @@ RESTARTS = 4
 LLOYD_ITERS = 25
 M_FACTOR = 30  # samples per codeword (samples = M_FACTOR * N_LEVELS)
 SCORE_MB = 1024  # approx MB per (chunk, N) score matrix
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # training device; checkpoint is always CPU
 OUT = f"/Volumes/security_engineering/nbutton/q34b/models/fibquant/fibquant_d{D}_k{K}_N{N_LEVELS}.pt"
 
 
 def main() -> None:
     bpc = (N_LEVELS - 1).bit_length() / K
-    print(f"building codebook d={D} k={K} N={N_LEVELS} -> b={bpc} bits/coord")
+    print(f"building codebook d={D} k={K} N={N_LEVELS} -> b={bpc} bits/coord on {DEVICE}")
     max_score_bytes = SCORE_MB * 2**20
 
-    codebook, counts = build_codebook(
+    result = build_codebook(
         D,
         K,
         N_LEVELS,
@@ -47,20 +56,24 @@ def main() -> None:
         lloyd_iters=LLOYD_ITERS,
         m_factor=M_FACTOR,
         max_score_bytes=max_score_bytes,
-        return_counts=True,
+        device=DEVICE,
     )
-    rotation = build_rotation(D, seed=SEED)
+    codebook, counts, mse = result.codebook, result.counts, result.mse
+    rotation = build_rotation(D, seed=SEED, device=DEVICE)
 
     min_dists = min_pairwise_distance(codebook, max_score_bytes=max_score_bytes)
     dead = int((counts == 0).sum())
     dead_frac = dead / N_LEVELS
 
-    mse = (codebook**2).mean().item()
-    spec = FibQuantSpec(codebook=codebook, rotation=rotation, d=D, k=K, n_levels=N_LEVELS)
+    # mse is the true quantization MSE (mean squared distance from held-out
+    # training samples to their nearest codeword) returned by build_codebook,
+    # not the mean squared codeword *norm* this script used to save under the
+    # same name.
+    spec = FibQuantSpec(codebook=codebook.cpu(), rotation=rotation.cpu(), d=D, k=K, n_levels=N_LEVELS)
     spec.save(OUT, seed=SEED, mse=mse)
     print(f"codebook radius range: [{codebook.norm(dim=-1).min():.4f}, {codebook.norm(dim=-1).max():.4f}]")
     print(f"min pairwise codeword distance: {min_dists.min():.4f}, mean: {min_dists.mean():.4f}")
-    print(f"codeword mean-squared norm: {mse:.4f}")
+    print(f"quantization MSE: {mse:.6f}")
     print(f"dead codewords: {dead}/{N_LEVELS} ({dead_frac:.2%})")
     if dead_frac > 0.01:
         print(

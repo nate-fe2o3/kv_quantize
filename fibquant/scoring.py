@@ -16,6 +16,14 @@ the geometry used to query it.
 
 The module also owns the chunked pairwise-distance diagnostics used by
 codebook-quality checks, since they share the same budget heuristic.
+
+`augment_codebook` is split out so callers that query the *same* codebook
+repeatedly (runtime encode via a prepared codec, see codec.py) can build the
+`[c, ||c||^2]` augmentation once and pass it back into `nearest` via
+`codebook_aug`, instead of paying for the concat + squared-norm reduction on
+every call. Offline codebook construction, where the codebook changes every
+Lloyd-Max iteration, keeps calling `nearest` without `codebook_aug` and gets
+the identical (recomputed-each-time) behavior it always had.
 """
 
 from __future__ import annotations
@@ -32,11 +40,22 @@ def chunk_rows_for(n_levels: int, max_score_bytes: int) -> int:
     return max(1, max_score_bytes // bytes_per_row)
 
 
+def augment_codebook(codebook: torch.Tensor) -> torch.Tensor:
+    """Precompute the `nearest` augmentation `[c, ||c||^2]`, shape (N, k + 1).
+
+    Pure function of the codebook alone (not the queried samples), so callers
+    with a fixed codebook across many `nearest` calls (runtime encode) should
+    compute this once and pass it back in as `nearest(..., codebook_aug=...)`.
+    """
+    return torch.cat([codebook, codebook.square().sum(-1, keepdim=True)], dim=-1)
+
+
 def nearest(
     samples: torch.Tensor,
     codebook: torch.Tensor,
     max_score_bytes: int = DEFAULT_SCORE_BYTES,
     chunk_rows: int | None = None,
+    codebook_aug: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Nearest-codeword assignment of each sample row against a codebook.
 
@@ -46,6 +65,13 @@ def nearest(
         max_score_bytes: fp32 budget for one (chunk, N) score matrix.
         chunk_rows: explicit chunk size override (tests force chunk=1).
             Defaults to the budget-derived size.
+        codebook_aug: precomputed `augment_codebook(codebook)`, i.e. (N, k+1)
+            with the squared-norm column already appended. Pass this in when
+            the codebook is unchanged across many calls (see codec.py's
+            PreparedCodec) to skip re-deriving it every time. Left as None
+            (the default), it is derived from `codebook` as before -- this is
+            what offline codebook construction does, since its codebook
+            changes every Lloyd-Max iteration and there is nothing to reuse.
 
     Returns:
         (indices, dist2): indices int64 (n,) with argmin codeword per row;
@@ -60,7 +86,7 @@ def nearest(
     # Augmented identity: score(s, c) = [2s, -1] . [c, ||c||^2].
     sample_aug = torch.cat([2.0 * samples, -torch.ones_like(samples[..., :1])], dim=-1)
     sample_norm2 = samples.square().sum(-1)
-    codebook_aug = torch.cat([codebook, codebook.square().sum(-1, keepdim=True)], dim=-1)
+    codebook_aug = codebook_aug if codebook_aug is not None else augment_codebook(codebook)
     if codebook_aug.device != samples.device:
         codebook_aug = codebook_aug.to(samples.device)
 

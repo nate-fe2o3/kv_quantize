@@ -18,8 +18,9 @@ from __future__ import annotations
 import torch
 from transformers import AutoTokenizer, DynamicCache
 
-from fibquant import FibQuantCache, FibQuantRuntime, FibQuantSpec, decode, encode
+from fibquant import FibQuantCache, FibQuantRuntime, FibQuantSpec
 from fibquant.eval_harness import load_model
+from fibquant.quantize import decode, encode
 
 # --- paths (Databricks volume layout) ------------------------------------
 MODEL_DIR = "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"

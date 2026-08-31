@@ -24,13 +24,26 @@ Invariants pinned by design (see CONTEXT.md):
   - FibQuantSpec validation already rejects d not divisible by k and 12-bit
     operating points with an odd block count; pack_indices remains as defense
     in depth.
+
+Codec state: `KVPayload` does not own a private codec. It asks
+`codec.prepared_codec_for_spec(self.spec, device)` for the (spec, device)
+PreparedCodec on every `update()`/`decode_all()` call. Since a FibQuantCache
+hands the *same* spec instance to every per-layer KVPayload (see cache.py),
+that cache is shared across every layer, not rebuilt per layer: N
+full-attention layers keep exactly one codebook/rotation/augmented-codebook
+copy per device, not N. The first call for a new device (the model's actual
+runtime device, e.g. CUDA/MPS) pays one device copy; every later call, from
+any layer sharing this spec, reuses the cached copy instead of re-deriving
+the augmented codebook or re-copying the codebook/rotation. See codec.py for
+why this matters (it used to happen on every single token, per layer).
 """
 
 from __future__ import annotations
 
 import torch
 
-from .quantize import decode, encode, pack_indices, unpack_indices
+from .codec import prepared_codec_for_spec
+from .quantize import pack_indices, unpack_indices
 from .spec import FibQuantSpec
 
 
@@ -44,13 +57,19 @@ class KVPayload:
         self.value_indices: torch.Tensor | None = None
         self.value_norms: torch.Tensor | None = None
 
+    def _codec_for(self, device: torch.device):
+        """The prepared codec resident on `device`, shared with every other
+        KVPayload built from this same spec instance (see codec.py)."""
+        return prepared_codec_for_spec(self.spec, device)
+
     # -- append / read ----------------------------------------------------
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         """Encode, pack, and append the incoming KV states."""
         spec = self.spec
-        k_idx, k_norm = encode(key_states, spec.codebook, spec.rotation, spec.k)
-        v_idx, v_norm = encode(value_states, spec.codebook, spec.rotation, spec.k)
+        codec = self._codec_for(key_states.device)
+        k_idx, k_norm = codec.encode(key_states)
+        v_idx, v_norm = codec.encode(value_states)
         k_idx = pack_indices(k_idx, spec.n_levels)
         v_idx = pack_indices(v_idx, spec.n_levels)
 
@@ -66,10 +85,11 @@ class KVPayload:
     def decode_all(self, dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Tensor, torch.Tensor]:
         """Dequantize the full cache: (keys, values) in storage order."""
         spec = self.spec
+        codec = self._codec_for(self.key_indices.device)
         key_ids = unpack_indices(self.key_indices, spec.n_levels)
         value_ids = unpack_indices(self.value_indices, spec.n_levels)
-        keys = decode(key_ids, self.key_norms, spec.codebook, spec.rotation, dtype=dtype)
-        values = decode(value_ids, self.value_norms, spec.codebook, spec.rotation, dtype=dtype)
+        keys = codec.decode(key_ids, self.key_norms, dtype=dtype)
+        values = codec.decode(value_ids, self.value_norms, dtype=dtype)
         return keys, values
 
     # -- sequence-dim protocol verbs (in place) ---------------------------

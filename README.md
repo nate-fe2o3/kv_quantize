@@ -7,7 +7,8 @@ Persistent KV memory drops ~8x at b=2 bits/coord (k=4, N=256), ~5.2x at b=3
 
 - **Domain model and seams:** [`CONTEXT.md`](CONTEXT.md) — read this first.
 - **Codebook construction:** [`scripts/build_codebook.py`](scripts/build_codebook.py)
-- **Run-time codec:** `fibquant/quantize.py` (encode/decode/packing)
+- **Run-time codec:** `fibquant/codec.py` (prepared device state) and
+  `fibquant/quantize.py` (packing + compatibility functions)
 - **Transformers integration:** `fibquant/cache.py` (`FibQuantCache`, `enable_fibquant`)
 - **Evaluations:** `scripts/eval_cuda.py` (Databricks/CUDA, see `env.yaml`) —
   a thin config over `fibquant/eval_harness.py`, tuned via the constants at
@@ -31,6 +32,7 @@ arguments) and runs on Databricks — as a notebook or directly on the cluster
 (`python scripts/<name>.py`), with the model/checkpoint volumes hardcoded:
 
 ```bash
+uv sync --extra eval --group dev                # local environment
 .venv/bin/python -m pytest                     # unit tests (local)
 .venv/bin/python scripts/sanity.py             # constants: SPEC_PATH, DEVICE
 .venv/bin/python scripts/build_codebook.py     # constants: D, K, N_LEVELS, ...

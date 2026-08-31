@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import random
-import re
 import time
 from pathlib import Path
 
@@ -34,6 +33,7 @@ from transformers import AutoTokenizer, DynamicCache
 
 from fibquant import FibQuantCache, FibQuantSpec
 from fibquant.eval_harness import load_model
+from fibquant.probes import build_spec_matrix, unique_filler_sentence
 
 # --- paths (Databricks volume layout) ------------------------------------
 MODEL_DIR = "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
@@ -60,62 +60,14 @@ KL_P95_PASS = 0.12
 TOP1_PASS = 0.99
 
 # --- filler: template-generated unique sentences -------------------------
-# Mirrors scripts/key_recall.py; pool/template changes must stay in sync.
-SENTENCE_TEMPLATES = [
-    "The {animal} {verb} through the {place} {when}.",
-    "A {animal} {verb} {adv} near the {place}.",
-    "The {adj} {animal} {verb} {adv} {when}.",
-    "The {occupation} {verb} {adv} beside a {noun}.",
-    "A {occupation} {verb} through the {place} {when}.",
-    "The {adj} {occupation} examined a {noun} {when}.",
-    "The {occupation} carried a {noun} across the {place}.",
-    "A {noun} {verb} {adv} on the {place} {when}.",
-    "The {adj} {noun} was {adv} visible {when}.",
-    "The {animal} watched the {adj} {noun} {when}.",
-    "A {noun} hung {adv} over the {place}.",
-    "The {adj} {occupation} saw a {noun} at the {place}.",
-    "Every {occupation} at the {place} owns a {noun}.",
-    "The {animal} hid {adv} behind the {noun} {when}.",
-]
-
-SENTENCE_POOLS = {
-    "animal": ["dog", "cat", "fox", "hawk", "heron", "otter", "badger", "lynx",
-               "eel", "newt", "crow", "seal", "wolf", "deer", "moose", "bison",
-               "gecko", "crane", "swan", "mole"],
-    "verb": ["wandered", "crept", "peered", "dashed", "drifted", "clambered",
-             "lingered", "scurried", "ambled", "soared", "trudged", "bounded",
-             "veered", "nestled", "vanished", "circled", "rested", "paced"],
-    "adv": ["quietly", "slowly", "steadily", "briefly", "softly", "gradually",
-            "warily", "eagerly", "haphazardly", "carefully", "awkwardly"],
-    "place": ["meadow", "harbor", "orchard", "courtyard", "thicket", "valley",
-              "station", "street", "rooftop", "corridor", "garden", "plateau",
-              "market", "tunnel", "attic", "promenade", "forest", "bridge"],
-    "noun": ["lantern", "ledger", "crate", "saddle", "hatbox", "map", "basket",
-             "kettle", "telescope", "compass", "bundle", "barrel", "mirror",
-             "whistle"],
-    "occupation": ["librarian", "baker", "blacksmith", "cartographer",
-                   "apothecary", "cartwright", "beekeeper", "clockmaker",
-                   "ferryman", "mason", "weaver", "oarsman", "lamplighter"],
-    "adj": ["weathered", "mottled", "sturdy", "curious", "weary", "faded",
-            "coiled", "glazed", "hollow", "bronze", "mossy", "threadbare"],
-    "when": ["at dusk", "before dawn", "in the rain", "under a thin moon",
-             "amid fog", "past midnight", "at first light", "in a stiff wind"],
-}
-
-_SLOT_RE = re.compile(r"\{(\w+)\}")
+# Templates, word pools, and the generator live in fibquant.probes (shared
+# with scripts/key_recall.py and scripts/multi_needle.py).
 
 
 def _sentence(tokenizer: AutoTokenizer, rng: random.Random, used: set[str]) -> list[int]:
     """One fresh, unique filler sentence as token ids (no marker constraint)."""
-    for _ in range(100):
-        template = rng.choice(SENTENCE_TEMPLATES)
-        text = template.format(**{s: rng.choice(SENTENCE_POOLS[s]) for s in _SLOT_RE.findall(template)})
-        if text in used:
-            continue
-        ids = tokenizer.encode(" " + text, add_special_tokens=False)
-        used.add(text)
-        return ids
-    raise ValueError("could not generate a unique filler sentence")
+    _, ids = unique_filler_sentence(tokenizer, rng, used)
+    return ids
 
 
 def build_doc(tokenizer: AutoTokenizer, n_tokens: int, seed: int) -> torch.Tensor:
@@ -130,7 +82,6 @@ def build_doc(tokenizer: AutoTokenizer, n_tokens: int, seed: int) -> torch.Tenso
 
 def _run_length(
     model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
     config_text,
     doc_ids: torch.Tensor,
     length: int,
@@ -143,16 +94,24 @@ def _run_length(
     quantized pass advances its own cache in lockstep, so result pairs share
     exact input positions.
     """
-    inputs = doc_ids[: length + 1].to(device)  # position i predicts token i+1
+    inputs = doc_ids[: length + 1].unsqueeze(0).to(device)  # (1, length+1); position i predicts token i+1
     cache_b = DynamicCache()
     fq_caches = {name: FibQuantCache(config=config_text, spec=spec) for name, spec in specs}
     stats = {name: {"sum_kl": 0.0, "kl_list": [], "disagree": 0, "n": 0} for name, _ in specs}
 
-    am = torch.ones_like(inputs)
+    # The attention_mask passed alongside a persistent past_key_values must
+    # cover the whole sequence the cache has seen so far (past + current
+    # chunk), not just the current chunk: Transformers' causal-mask builder
+    # derives kv_length from past_key_values.get_seq_length() + the new
+    # chunk and right-pads/right-slices a shorter mask, which would silently
+    # mark the *earlier* real tokens as padding instead of the (nonexistent)
+    # trailing ones. There is no padding here (batch size 1, one dense
+    # document), so a full ones mask sliced to the running length is exact.
+    full_mask = torch.ones_like(inputs)
     with torch.no_grad():
         for start in range(0, length, CHUNK):
-            chunk = inputs[start : start + CHUNK]
-            am_chunk = am[:, start : start + CHUNK]
+            chunk = inputs[:, start : start + CHUNK]
+            am_chunk = full_mask[:, : start + chunk.shape[1]]
             out_b = model(chunk, attention_mask=am_chunk, past_key_values=cache_b)
             la = torch.log_softmax(out_b.logits.float(), dim=-1)  # (1, C, V)
             pa = la.exp()
@@ -185,12 +144,7 @@ def _summarize(stats: dict) -> dict:
 
 
 def main() -> None:
-    specs: list[tuple[str, FibQuantSpec]] = []
-    for bits in BITS:
-        specs.append((f"fq-b{bits}", FibQuantSpec.from_bits(d=256, k=4, bits=bits)))
-    for p in SPEC_PATHS:
-        spec = FibQuantSpec.from_path(p)
-        specs.append((f"fq-N{spec.n_levels}", spec))
+    specs = build_spec_matrix(include_baseline=False, bits=BITS, spec_paths=SPEC_PATHS)
     if not specs:
         raise ValueError("set BITS/SPEC_PATHS so at least one quantized configuration runs")
     if not CONTEXT_LENGTHS:
@@ -210,7 +164,7 @@ def main() -> None:
         t0 = time.time()
         agg: dict[str, dict] = {name: {"sum_kl": 0.0, "kl_list": [], "disagree": 0, "n": 0} for name, _ in specs}
         for doc in docs:
-            stats = _run_length(model, tokenizer, config_text, doc, length, specs, DEVICE)
+            stats = _run_length(model, config_text, doc, length, specs, DEVICE)
             for name, _ in specs:
                 s = agg[name]
                 s["sum_kl"] += stats[name]["sum_kl"]

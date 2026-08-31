@@ -38,7 +38,11 @@ def test_crop_matches_dynamic_layer_semantics(small_spec):
     assert pl.seq_length == 2
     pl.crop(0)  # base DynamicLayer.crop(0) empties the cache -- must match
     assert pl.seq_length == 0
-    assert pl.decode_all()[0].shape[-2] == 0
+    empty_keys, empty_values = pl.decode_all()
+    # regression: an empty decode's last dim must be d (blocks * k), not k
+    # alone (see fibquant.codec.PreparedCodec.decode).
+    assert empty_keys.shape == (2, 3, 0, small_spec.d)
+    assert empty_values.shape == (2, 3, 0, small_spec.d)
 
 
 def test_crop_on_empty_is_noop(small_spec):
@@ -96,3 +100,17 @@ def test_packed_storage_accounting(packed_spec):
     assert pl.key_indices.shape[-1] == 6
     keys, _ = pl.decode_all(dtype=torch.float32)
     assert torch.nn.functional.cosine_similarity(k, keys, dim=-1).mean() > 0.99
+
+
+def test_packed_crop_zero_decode_empty_shape(packed_spec):
+    """Regression: cropping a 12-bit pair-packed payload to empty must decode
+    to (batch, heads, 0, d), not crash. unpack_indices used to reshape the
+    packed bytes into (..., -1, 3), which is ambiguous for 0 elements."""
+    pl = KVPayload(packed_spec)
+    k, v = _states(batch=2, heads=3, seq=8)
+    pl.update(k, v)
+    pl.crop(0)
+    assert pl.seq_length == 0
+    keys, values = pl.decode_all(dtype=torch.float32)
+    assert keys.shape == (2, 3, 0, packed_spec.d)
+    assert values.shape == (2, 3, 0, packed_spec.d)

@@ -5,15 +5,23 @@ description = "FibQuant KV-cache compression research"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "accelerate>=1.14.0",
-    "immutabledict>=4.3.1",
-    "langdetect>=1.0.9",
-    "lm-eval>=0.4.12",
-    "nltk>=3.10.3",
     "numpy>=2.5",
     "scipy>=1.18.0",
+    "torch>=2.13",
     "transformers>=5.15",
+]
+
+[project.optional-dependencies]
+eval = [
+    "accelerate>=1.14.0",
+    "datasets>=5.0.1",
+    "lm-eval>=0.4.12",
     "typing_extensions>=4.15",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
 ]
 
 [tool.pytest.ini_options]

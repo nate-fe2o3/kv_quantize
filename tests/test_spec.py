@@ -3,13 +3,22 @@
 import pytest
 import torch
 
-from fibquant.codebook import build_codebook, build_rotation
+from fibquant.codebook import build_directions, build_radii, build_rotation
 from fibquant.spec import FibQuantSpec, load_spec, spec_path
 
 
-def _raw(d=8, k=2, n_levels=16, seed=0):
-    torch.manual_seed(seed)
-    return build_codebook(d, k, n_levels, seed=seed, restarts=1, lloyd_iters=2, m_factor=8)
+def _raw(d=8, k=2, n_levels=16):
+    """Codebook of the right (n_levels, k) shape for validation/save-load tests.
+
+    None of test_spec.py's assertions depend on quantization quality (only
+    shape, bits arithmetic, and checkpoint round-tripping), so this uses the
+    untrained radii*directions init directly instead of build_codebook: no
+    Lloyd-Max, no (samples, n_levels) training score matrix -- keeps the
+    n_levels=4096/65536 cases here cheap.
+    """
+    radii = build_radii(d, k, n_levels)
+    directions = build_directions(k, n_levels)
+    return radii.unsqueeze(-1) * directions
 
 
 def test_validation_rejects_bad_operating_points():
@@ -45,7 +54,6 @@ def test_bits_per_coord_and_path_convention():
 
 
 def test_from_bits_derives_n_levels_and_rejects_bad_bits(tmp_path):
-    torch.manual_seed(0)
     out = tmp_path / "fibquant_d8_k2_N16.pt"
     FibQuantSpec(
         codebook=_raw(), rotation=build_rotation(8, 0), d=8, k=2, n_levels=16
@@ -69,7 +77,6 @@ def test_from_bits_default_path_missing_is_actionable(tmp_path):
 
 
 def test_save_load_roundtrip_preserves_checkpoint_dict(tmp_path):
-    torch.manual_seed(0)
     spec = FibQuantSpec(
         codebook=_raw(n_levels=4096), rotation=build_rotation(8, 0), d=8, k=2, n_levels=4096
     )

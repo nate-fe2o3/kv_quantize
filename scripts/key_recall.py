@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import random
-import re
 import time
 from pathlib import Path
 
@@ -29,6 +28,14 @@ from transformers import AutoTokenizer
 
 from fibquant import FibQuantCache, FibQuantSpec
 from fibquant.eval_harness import load_model
+from fibquant.probes import (
+    SENTENCE_POOLS,
+    build_spec_matrix,
+    normalize_continuation,
+    required_answer_tokens as _required_answer_tokens,
+    unique_filler_sentence,
+    validate_markers,
+)
 
 # --- paths (Databricks volume layout) ------------------------------------
 MODEL_DIR = "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
@@ -64,118 +71,33 @@ OUT = None  # write JSON results here, or None to only print the table
 SYSTEM_PROMPT = "You answer in one short phrase, nothing else."
 
 # --- filler: template-generated unique sentences -------------------------
-# Every filler sentence is one template + iid slot words (no config, no files,
-# no repeating passages). Pool products make exact collisions astronomically
-# unlikely; a per-build `used` set makes it impossible regardless. The marker
-# word and anything containing it are absent from the pools by construction,
-# and the generated sentence is decode-verified before use.
-SENTENCE_TEMPLATES = [
-    "The {animal} {verb} through the {place} {when}.",
-    "A {animal} {verb} {adv} near the {place}.",
-    "The {adj} {animal} {verb} {adv} {when}.",
-    "The {occupation} {verb} {adv} beside a {noun}.",
-    "A {occupation} {verb} through the {place} {when}.",
-    "The {adj} {occupation} examined a {noun} {when}.",
-    "The {occupation} carried a {noun} across the {place}.",
-    "A {noun} {verb} {adv} on the {place} {when}.",
-    "The {adj} {noun} was {adv} visible {when}.",
-    "The {animal} watched the {adj} {noun} {when}.",
-    "A {noun} hung {adv} over the {place}.",
-    "The {adj} {occupation} saw a {noun} at the {place}.",
-    "Every {occupation} at the {place} owns a {noun}.",
-    "The {animal} hid {adv} behind the {noun} {when}.",
-]
-
-SENTENCE_POOLS = {
-    "animal": ["dog", "cat", "fox", "hawk", "heron", "otter", "badger", "lynx",
-               "eel", "newt", "crow", "seal", "wolf", "deer", "moose", "bison",
-               "gecko", "crane", "swan", "mole"],
-    "verb": ["wandered", "crept", "peered", "dashed", "drifted", "clambered",
-             "lingered", "scurried", "ambled", "soared", "trudged", "bounded",
-             "veered", "nestled", "vanished", "circled", "rested", "paced"],
-    "adv": ["quietly", "slowly", "steadily", "briefly", "softly", "gradually",
-            "warily", "eagerly", "haphazardly", "carefully", "awkwardly"],
-    "place": ["meadow", "harbor", "orchard", "courtyard", "thicket", "valley",
-              "station", "street", "rooftop", "corridor", "garden", "plateau",
-              "market", "tunnel", "attic", "promenade", "forest", "bridge"],
-    "noun": ["lantern", "ledger", "crate", "saddle", "hatbox", "map", "basket",
-             "kettle", "telescope", "compass", "bundle", "barrel", "mirror",
-             "whistle"],
-    "occupation": ["librarian", "baker", "blacksmith", "cartographer",
-                   "apothecary", "cartwright", "beekeeper", "clockmaker",
-                   "ferryman", "mason", "weaver", "oarsman", "lamplighter"],
-    "adj": ["weathered", "mottled", "sturdy", "curious", "weary", "faded",
-            "coiled", "glazed", "hollow", "bronze", "mossy", "threadbare"],
-    "when": ["at dusk", "before dawn", "in the rain", "under a thin moon",
-             "amid fog", "past midnight", "at first light", "in a stiff wind"],
-}
-
-_SLOT_RE = re.compile(r"\{(\w+)\}")
+# Templates, word pools, and the generator live in fibquant.probes (shared
+# with scripts/multi_needle.py and scripts/logit_kl.py); the marker word and
+# anything containing it are absent from the pools by construction, and the
+# generated sentence is decode-verified before use.
 
 
-def normalize_continuation(text: str) -> str:
-    """Lowercase and collapse whitespace before marker matching.
+def validate_marker(marker: str, pools: dict[str, list[str]] = SENTENCE_POOLS) -> None:
+    """Single-marker convenience wrapper over fibquant.probes.validate_markers.
 
-    Multi-token markers are phrases, and the model may insert extra spaces or
-    line breaks between the words ("blue   whale") without forgetting them --
-    those must not count as recall misses. (A word glued mid-word --
-    "bluewhale" -- still does; keep markers to words/short phrases.) Kept in
-    sync with scripts/multi_needle.py.
+    key_recall configures exactly one MARKER (a word or short phrase, not a
+    list), so this keeps the script's public surface string-typed while
+    sharing the actual invariant checks (empty/pool-reachability; duplicate
+    and self-overlap checks are no-ops for a single marker).
     """
-    return " ".join(text.lower().split())
+    validate_markers([marker], pools)
 
 
-def validate_marker(marker: str, pools: dict[str, list[str]]) -> None:
-    """Startup invariants for one marker (raises ValueError).
-
-    Multi-token markers are allowed; the single-token rule was dropped. What
-    must hold: the marker is non-empty and not reachable from the filler
-    pools (a marker that can legitimately appear in filler breaks the test;
-    _sentence also re-verifies every generated sentence).
-    """
-    if not marker.strip():
-        raise ValueError(f"MARKER {marker!r} is empty/whitespace-only")
-    marker_l = marker.lower()
-    for slot, words in pools.items():
-        for w in words:
-            if marker_l in w.lower():
-                raise ValueError(f"MARKER {marker!r} appears in filler pool '{slot}' as {w!r}")
-
-
-def required_answer_tokens(
-    tokenizer: AutoTokenizer,
-    marker: str,
-    slack: int = ANSWER_BUDGET_SLACK,
-) -> int:
-    """Minimum generation budget for one trial: verbose marker + slack.
-
-    The model may answer with full framing ("Special token: blue whale.")
-    rather than the bare word; the budget is sized against that. A smaller
-    budget risks a truncated continuation, which counts as a recall miss --
-    an underestimate (see MAX_NEW_TOKENS). Kept in sync with
-    scripts/multi_needle.py.
-    """
-    return len(tokenizer.encode(f" Special token: {marker}.", add_special_tokens=False)) + slack
+def required_answer_tokens(tokenizer: AutoTokenizer, markers: list[str], slack: int = ANSWER_BUDGET_SLACK) -> int:
+    """Thin wrapper over fibquant.probes.required_answer_tokens binding this
+    script's own ANSWER_BUDGET_SLACK as the default slack."""
+    return _required_answer_tokens(tokenizer, markers, slack)
 
 
 def _sentence(tokenizer: AutoTokenizer, rng: random.Random, marker: str, used: set[str]) -> list[int]:
-    """One fresh, unique, marker-free filler sentence as token ids.
-
-    Encoded with a leading space so the sentence-initial word is the *mid-text*
-    token variant (" A" != "A" in this BPE), keeping the concatenated filler
-    properly spaced at the token level.
-    """
-    for _ in range(100):
-        template = rng.choice(SENTENCE_TEMPLATES)
-        text = template.format(**{s: rng.choice(SENTENCE_POOLS[s]) for s in _SLOT_RE.findall(template)})
-        if text in used:
-            continue
-        ids = tokenizer.encode(" " + text, add_special_tokens=False)
-        if marker.lower() in tokenizer.decode(ids).lower():
-            continue
-        used.add(text)
-        return ids
-    raise ValueError("could not generate a unique marker-free filler sentence")
+    """One fresh, unique, marker-free filler sentence as token ids."""
+    _, ids = unique_filler_sentence(tokenizer, rng, used, avoid=(marker.lower(),))
+    return ids
 
 
 def build_trials(
@@ -240,6 +162,7 @@ def run_config(
 ) -> dict[int, float]:
     """Run every depth for one cache configuration; return recall per depth."""
     results: dict[int, float] = {}
+    marker_l = marker.lower()  # conts are normalized (lowercased); match on the same footing
     for depth in sorted(inputs_by_depth):
         inputs = inputs_by_depth[depth].to(device)
         hits = 0
@@ -257,20 +180,13 @@ def run_config(
                     past_key_values=cache,
                 )
                 conts = [normalize_continuation(tokenizer.decode(row[chunk.shape[-1]:])) for row in out]
-                hits += sum(marker in c for c in conts)  # conts are normalized (lowercased)
+                hits += sum(marker_l in c for c in conts)
         results[depth] = hits / inputs.shape[0]
     return results
 
 
 def main() -> None:
-    specs: list[tuple[str, FibQuantSpec | None]] = []
-    if INCLUDE_BASELINE:
-        specs.append(("baseline", None))
-    for bits in BITS:
-        specs.append((f"fq-b{bits}", FibQuantSpec.from_bits(d=256, k=4, bits=bits)))
-    for p in SPEC_PATHS:
-        spec = FibQuantSpec.from_path(p)
-        specs.append((f"fq-N{spec.n_levels}", spec))
+    specs = build_spec_matrix(INCLUDE_BASELINE, BITS, SPEC_PATHS)
     if not specs:
         raise ValueError("set BITS/SPEC_PATHS or INCLUDE_BASELINE so at least one configuration runs")
 
@@ -285,7 +201,7 @@ def main() -> None:
     # pool edit introduces it. Single-token-ness is NOT required: multi-token
     # markers are supported (see normalize_continuation).
     validate_marker(MARKER, SENTENCE_POOLS)
-    required = required_answer_tokens(tokenizer, MARKER)
+    required = required_answer_tokens(tokenizer, [MARKER], slack=ANSWER_BUDGET_SLACK)
     if MAX_NEW_TOKENS is not None and MAX_NEW_TOKENS < required:
         raise ValueError(
             f"MAX_NEW_TOKENS={MAX_NEW_TOKENS} below required {required} for MARKER={MARKER!r}; "

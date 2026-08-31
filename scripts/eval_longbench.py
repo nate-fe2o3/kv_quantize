@@ -38,6 +38,7 @@ one would append the continuation across questions).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -51,6 +52,7 @@ from transformers import AutoTokenizer
 
 from fibquant import FibQuantCache, FibQuantSpec
 from fibquant.eval_harness import load_model
+from fibquant.probes import build_spec_matrix
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 
@@ -227,32 +229,237 @@ def summarize(rows: list[dict]) -> dict:
     return summary
 
 
+# --- resume safety: a manifest/fingerprint gates every resumed run --------
+# A killed/rescheduled run resumes results.jsonl by _id (see run_config); that
+# is only safe if the *meaning* of a row hasn't changed underneath it. The
+# manifest below is that meaning, fingerprinted: model/config identity,
+# checkpoint identity + content, prompt/template/generation settings, and the
+# selected dataset scope. Two runs with an identical manifest produce directly
+# comparable, mixable rows; any difference means resuming would silently
+# blend incompatible results, so mismatches (and unverifiable prior output)
+# refuse to resume instead of guessing.
+_MANIFEST_VERSION = 1
+_MANIFEST_NAME = "manifest.json"
+
+
+def model_identity(model_dir: str, config_text) -> dict:
+    """Cheap model/config identity fingerprint (no full-weight hashing).
+
+    Enough to catch "pointed the script at a different model directory or a
+    materially different config" without hashing multi-GB checkpoint shards.
+    """
+    fields = ("model_type", "hidden_size", "num_hidden_layers", "vocab_size", "max_position_embeddings")
+    return {"model_dir": str(model_dir), **{f: getattr(config_text, f, None) for f in fields}}
+
+
+def spec_fingerprint(spec: FibQuantSpec | None) -> dict | None:
+    """Checkpoint identity + content metadata for one FibQuant spec (None => fp16 baseline).
+
+    Identity is (d, k, n_levels); content is the actual codebook/rotation
+    tensors (hashed, not stored) plus training provenance (seed, mse) -- two
+    checkpoints with identical shape but a different training run must not
+    be treated as resume-compatible.
+    """
+    if spec is None:
+        return None
+    return {
+        "d": spec.d,
+        "k": spec.k,
+        "n_levels": spec.n_levels,
+        "seed": spec.seed,
+        "mse": spec.mse,
+        "codebook_sha256": hashlib.sha256(spec.codebook.detach().cpu().contiguous().numpy().tobytes()).hexdigest(),
+        "rotation_sha256": hashlib.sha256(spec.rotation.detach().cpu().contiguous().numpy().tobytes()).hexdigest(),
+    }
+
+
+def build_manifest(
+    *,
+    model_identity: dict,
+    spec: FibQuantSpec | None,
+    max_context: int,
+    max_new_tokens: int,
+    dataset_name: str,
+    limit: int | None,
+    n_items: int,
+    items_sha256: str,
+) -> dict:
+    """One run's fingerprint: everything that changes what a results.jsonl row means."""
+    return {
+        "version": _MANIFEST_VERSION,
+        "model": model_identity,
+        "spec": spec_fingerprint(spec),
+        "prompt_template_sha256": hashlib.sha256(PROMPT_0SHOT.encode("utf-8")).hexdigest(),
+        "generation": {
+            "max_context": max_context,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "enable_thinking": False,
+        },
+        "dataset": {
+            "name": dataset_name,
+            "limit": limit,
+            "n_items": n_items,
+            "items_sha256": items_sha256,
+        },
+    }
+
+
+def items_fingerprint(items: list[dict]) -> str:
+    """Order-sensitive hash of every question's prompt-relevant content.
+
+    Hashing only `_id` would treat a changed question/context/choices/answer
+    under a stable id (a dataset revision, or a local edit) as identical
+    scope, silently mixing pre-/post-change rows into one resumed run. Each
+    item's canonical prompt-relevant fields (the shape normalize_item
+    produces) are hashed in dataset order, so any content edit -- not just
+    an id/count change -- changes the fingerprint, and reordering the same
+    items also changes it (order-sensitive).
+    """
+    canonical = [
+        {
+            "_id": it.get("_id"),
+            "question": it["question"],
+            "choices": list(it["choices"]),
+            "answer": it["answer"],
+            "context": it["context"],
+        }
+        for it in items
+    ]
+    blob = "\n".join(json.dumps(c, sort_keys=True, ensure_ascii=False) for c in canonical)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def load_manifest(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def ensure_manifest_compatible(run_dir: Path, out_jsonl: Path, manifest: dict) -> None:
+    """Refuse to resume `out_jsonl` if this run's identity doesn't match the prior one.
+
+    A `results.jsonl` with no manifest (pre-manifest output, or a manually
+    edited run dir) is ambiguous, not "assume compatible" -- silent mixing is
+    exactly what this guards against, so that case fails closed too. A fresh
+    run dir (no results yet) always gets the current manifest written.
+    """
+    manifest_path = run_dir / _MANIFEST_NAME
+    if out_jsonl.exists():
+        existing = load_manifest(manifest_path)
+        if existing is None:
+            raise RuntimeError(
+                f"{out_jsonl} exists without a manifest at {manifest_path}; refusing to "
+                "resume an output whose run identity cannot be verified. Move/delete the "
+                "old results to start fresh."
+            )
+        if existing != manifest:
+            raise RuntimeError(
+                f"manifest mismatch for {run_dir}: this run's model/config/checkpoint/"
+                "prompt/dataset identity differs from the previous run that produced "
+                f"{out_jsonl}. Refusing to resume and mix incompatible rows.\n"
+                f"previous manifest: {json.dumps(existing, indent=2, sort_keys=True)}\n"
+                f"current manifest:  {json.dumps(manifest, indent=2, sort_keys=True)}"
+            )
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+def read_jsonl_rows(path: Path) -> tuple[list[dict], bool]:
+    """Every complete row in one results.jsonl, plus whether the trailing line was truncated.
+
+    A killed run can leave a partially-written last line (`flush()` has no
+    crash-safety guarantee against e.g. SIGKILL mid-write); every earlier
+    line was fully written and flushed before the next append, so only the
+    last line can be corrupt -- any earlier corrupt line re-raises instead
+    of being silently dropped.
+
+    Returns (rows, was_truncated). `was_truncated` rows have already been
+    dropped from the returned list, but the corrupt bytes are still on disk;
+    a caller that will append afterward must call `repair_truncated_jsonl`
+    (or `load_and_repair_jsonl`) first, or the new JSON lands right after
+    the partial bytes and the file stays permanently corrupt.
+    """
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
+    rows: list[dict] = []
+    truncated = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            rows.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            if i != len(lines) - 1:
+                raise
+            truncated = True
+            logging.warning("discarding truncated trailing line in %s (killed mid-write)", path)
+    return rows, truncated
+
+
+def repair_truncated_jsonl(path: Path, rows: list[dict]) -> None:
+    """Atomically rewrite `path` to contain exactly `rows`, one JSON object per line.
+
+    Used right after `read_jsonl_rows` reports a truncated trailing line:
+    the in-memory `rows` already dropped the partial line, but the bytes on
+    disk still end with it, so a later `open(path, "a")` would concatenate
+    new JSON onto those partial bytes and permanently corrupt the file.
+    Writes a sibling temp file and `os.replace`s over the original so a
+    crash mid-repair never leaves a half-written file in `path`'s place.
+    """
+    tmp = path.with_name(path.name + ".repair.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def load_and_repair_jsonl(path: Path) -> list[dict]:
+    """`read_jsonl_rows`, repairing `path` in place first if it was truncated.
+
+    Safe to call before appending: by the time this returns, `path` on disk
+    holds exactly the returned rows, so a subsequent append lands after
+    complete JSON.
+    """
+    rows, truncated = read_jsonl_rows(path)
+    if truncated:
+        logging.warning("repairing %s: truncating to the last complete row before continuing", path)
+        repair_truncated_jsonl(path, rows)
+    return rows
+
+
 def run_config(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompts: list[dict],
     spec: FibQuantSpec | None,
-    out_jsonl: Path,
+    run_dir: Path,
+    manifest: dict,
 ) -> tuple[list[dict], float]:
     """Generate every prompt once with one cache configuration; resumes.
 
     Generates sequentially (one 262k-token prompt at a time; batching long
     prompts multiplies peak memory) and appends one JSON line per question,
-    so killed runs resume by _id. Returns (rows, wall seconds).
+    so killed runs resume by _id. Resume is gated by `manifest` (see
+    ensure_manifest_compatible): incompatible or unverifiable prior output
+    raises instead of silently mixing. Returns (rows, wall seconds), where
+    rows always covers the *complete* output (resumed + freshly generated),
+    so a resumed summary is never partial.
     """
+    out_jsonl = run_dir / "results.jsonl"
+    ensure_manifest_compatible(run_dir, out_jsonl, manifest)
+
     config_text = model.config.text_config
-    pending: list[dict] = []
     done_ids: set[str] = set()
     if out_jsonl.exists():
-        with open(out_jsonl, encoding="utf-8") as f:
-            done_ids = {json.loads(line)["_id"] for line in f}
-    for p in prompts:
-        if p["_id"] not in done_ids:
-            pending.append(p)
+        # Repair (truncate to the last complete row) before appending, or a
+        # truncated trailing line from a killed prior run would get new JSON
+        # concatenated onto its partial bytes.
+        done_ids = {row["_id"] for row in load_and_repair_jsonl(out_jsonl)}
+    pending = [p for p in prompts if p["_id"] not in done_ids]
     if done_ids:
         logging.info("resuming: %d/%d already in %s", len(done_ids), len(prompts), out_jsonl)
 
-    rows: list[dict] = []
     t0 = time.time()
     with torch.no_grad(), open(out_jsonl, "a", encoding="utf-8") as fout:
         for i, p in enumerate(pending, 1):
@@ -283,26 +490,19 @@ def run_config(
                 "n_doc_tokens": p["n_doc_tokens"],
                 "truncated": p["truncated"],
             }
-            rows.append(row)
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
             fout.flush()
             if i % 25 == 0 or i == len(pending):
                 logging.info("  %d/%d generated (%.0fs)", i, len(pending), time.time() - t0)
     # Return every row on disk (resumed + fresh) so summaries never go partial.
-    with open(out_jsonl, encoding="utf-8") as f:
-        rows = [json.loads(line) for line in f]
+    # A truncated trailing line here can only be this run's own last append
+    # getting killed; repairing keeps the file valid for the *next* resume.
+    rows = load_and_repair_jsonl(out_jsonl)
     return rows, time.time() - t0
 
 
 def main() -> None:
-    specs: list[tuple[str, FibQuantSpec | None]] = []
-    if INCLUDE_BASELINE:
-        specs.append(("baseline", None))
-    for bits in BITS:
-        specs.append((f"fq-b{bits}", FibQuantSpec.from_bits(d=256, k=4, bits=bits)))
-    for path in SPEC_PATHS:
-        spec = FibQuantSpec.from_path(path)
-        specs.append((f"fq-N{spec.n_levels}", spec))
+    specs = build_spec_matrix(INCLUDE_BASELINE, BITS, SPEC_PATHS)
     if not specs:
         raise ValueError("set BITS/SPEC_PATHS or INCLUDE_BASELINE so at least one configuration runs")
 
@@ -340,10 +540,22 @@ def main() -> None:
     out_root = Path(OUTPUT_DIR) / "longbench_v2"
     suffix = "smoke" if LIMIT else ""
     results: dict[str, dict] = {}
+    identity = model_identity(str(model_dir), model.config.text_config)
+    items_sha256 = items_fingerprint(items)
     for name, spec in specs:
         run_dir = out_root / (f"{name}-{suffix}" if suffix else name)
         run_dir.mkdir(parents=True, exist_ok=True)
-        rows, secs = run_config(model, tokenizer, prompts, spec, run_dir / "results.jsonl")
+        manifest = build_manifest(
+            model_identity=identity,
+            spec=spec,
+            max_context=max_context,
+            max_new_tokens=MAX_NEW_TOKENS,
+            dataset_name=DATASET_NAME,
+            limit=LIMIT,
+            n_items=len(items),
+            items_sha256=items_sha256,
+        )
+        rows, secs = run_config(model, tokenizer, prompts, spec, run_dir, manifest)
         summary = summarize(rows)
         summary["wall_seconds"] = round(secs, 1)
         results[name] = summary

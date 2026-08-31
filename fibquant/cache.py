@@ -29,10 +29,9 @@ import torch
 from transformers.cache_utils import DynamicCache, DynamicLayer
 
 from .payload import KVPayload
-from .runtime import FibQuantRuntime
 from .spec import FibQuantSpec
 
-__all__ = ["FibQuantCache", "FibQuantLayer", "FibQuantSpec", "FibQuantRuntime", "enable_fibquant"]
+__all__ = ["FibQuantCache", "FibQuantLayer", "FibQuantSpec"]
 
 
 class FibQuantLayer(DynamicLayer):
@@ -128,19 +127,3 @@ class FibQuantCache(DynamicCache):
         return sum(
             layer.fp16_bytes() if isinstance(layer, FibQuantLayer) else 0 for layer in self.layers
         )
-
-
-def enable_fibquant(
-    model: torch.nn.Module | None = None,
-    spec: FibQuantSpec | None = None,
-) -> FibQuantRuntime:
-    """Backwards-compatible install wrapper; prefer FibQuantRuntime.
-
-    Preserves the old (model, spec) call shape. Unlike the original one-shot
-    patch, the runtime install is idempotent per operating point, re-patches
-    (with a warning) when a different spec is installed, covers generate()
-    via the cache-factory patch, and offers uninstall()/active_spec.
-    """
-    if spec is None:
-        raise ValueError("enable_fibquant requires a spec (pass spec=...)")
-    return FibQuantRuntime(spec).install(model=model)

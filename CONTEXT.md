@@ -31,6 +31,10 @@ terms consistently in code, docs, and reviews.
   peak memory stays within a budget. Single implementation shared by offline
   codebook construction (Lloyd-Max assignment, final-MSE evaluation) and
   runtime `encode`. Also owns the chunked pairwise min-distance diagnostics.
+- **Prepared codec** (`fibquant/codec.py`) — device-resident codebook, rotation,
+  transpose, and augmented scoring state for one spec. All payloads sharing a
+  spec reuse one prepared codec per device; the compatibility functions in
+  `quantize.py` are one-call adapters over this module.
 - **KV payload** (`fibquant/payload.py`) — the compressed storage of one
   layer: (packed) block indices + fp16 norms for keys and values. Owns the
   storage format (container dtype policy, dim conventions, pair-packing,
@@ -39,15 +43,20 @@ terms consistently in code, docs, and reviews.
   adjacent k-blocks of one head vector are pair-packed, never across tokens,
   so sequence-dim ops never need unpack-repack.
 - **Eval harness** (`fibquant/eval_harness.py`) — one deep adapter over
-  lm-eval: model loading (incl. the MPS single-worker fix), `enable_fibquant`,
-  the generate-path cache injection, presence-penalty emulation, and results
-  emission. `run_eval(EvalConfig)` is the interface for eval scripts.
+  lm-eval: model loading (incl. the MPS single-worker fix), scoped runtime
+  installation, per-row presence-penalty emulation, and results emission.
+  `run_eval(EvalConfig)` is the interface for eval scripts.
+- **Probe support** (`fibquant/probes.py`) — deterministic unique filler,
+  marker invariants, answer budgets, and operating-point matrices shared by
+  the recall, logit-fidelity, and LongBench scripts. Each script retains its
+  scenario-specific prompt layout, generation loop, and metrics.
 - **Runtime install** (`fibquant/runtime.py`) — the explicit lifecycle of the
   FibQuant patches: `FibQuantRuntime(spec).install(model=None|model)` patches
   the model class's `forward()` and its generate cache factory
   (`_prepare_cache_for_generation`) together; idempotent per operating point,
-  re-patches with a warning on a different spec, `uninstall()` restores the
-  originals, `active_spec`/`active_specs()` expose the current state.
+  re-patches with a warning on a different spec, context-managed installs
+  restore prior state, `uninstall()` restores the originals, and
+  `active_spec`/`active_specs()` expose the current state.
   `enable_fibquant` is a thin back-compat wrapper over it.
 
 ## Environment specifics (load-bearing facts)

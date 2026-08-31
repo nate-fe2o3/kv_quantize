@@ -32,6 +32,30 @@ def test_encode_decode_roundtrip(small_spec):
     assert cos.mean() > 0.9
 
 
+def test_decode_empty_output_shape_is_blocks_times_k(small_spec):
+    """Regression: an empty cache (e.g. after crop(0)) must decode to a
+    logical last dim of blocks * k (== d), not codebook.shape[1] (== k
+    alone) -- the latter silently truncated every empty decode to k
+    coordinates instead of d."""
+    blocks = small_spec.d // small_spec.k
+    indices = torch.empty(2, 3, 0, blocks, dtype=torch.uint8)
+    norms = torch.empty(2, 3, 0, dtype=torch.float16)
+    x_hat = decode(indices, norms, small_spec.codebook, small_spec.rotation, dtype=torch.float32)
+    assert x_hat.shape == (2, 3, 0, small_spec.d)
+
+
+def test_unpack_indices_empty_packed_shape(packed_spec):
+    """Regression: unpacking an empty 12-bit packed tensor must not crash
+    (reshape(..., -1, 3) of 0 elements is ambiguous) and must recover the
+    logical block count (packed_dim * 2 // 3), not silently drop it."""
+    blocks = packed_spec.d // packed_spec.k  # 4
+    packed_dim = blocks * 3 // 2  # 6, pair-packed
+    packed = torch.empty(2, 3, 0, packed_dim, dtype=torch.uint8)
+    unpacked = unpack_indices(packed, packed_spec.n_levels)
+    assert unpacked.shape == (2, 3, 0, blocks)
+    assert unpacked.dtype is torch.uint16
+
+
 def test_encode_packed_roundtrip(packed_spec):
     torch.manual_seed(0)
     x = torch.randn(2, 1, 8, 8)

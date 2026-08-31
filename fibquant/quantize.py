@@ -3,13 +3,22 @@
 Tensors are (batch, heads, seq, d) with d = head dim. Each head-vector is
 independently encoded: fp16 norm header + one uint8/uint16 container element
 (block index) per k-block.
+
+`encode`/`decode` below are compatibility adapters: they keep the original
+bare-tensor call shape (codebook, rotation passed in directly) by building a
+throwaway `codec.PreparedCodec` per call. That throwaway has nowhere to
+amortize a device move or the augmented-codebook precompute across calls, so
+callers on a hot path (KVPayload, in payload.py) build one `PreparedCodec`
+once and reuse it via `codec.prepared_codec_for` instead of calling these
+functions -- see codec.py for the deep primitive and the reasoning.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .scoring import DEFAULT_SCORE_BYTES, nearest
+from .codec import PreparedCodec
+from .scoring import DEFAULT_SCORE_BYTES
 
 
 def index_dtype(n_levels: int) -> torch.dtype:
@@ -57,6 +66,13 @@ def unpack_indices(packed: torch.Tensor, n_levels: int) -> torch.Tensor:
     bits = int(n_levels - 1).bit_length()
     if bits != _BITS_PACKED:
         return packed
+    if packed.numel() == 0:
+        # Empty cache (e.g. after crop(0)): reshape(..., -1, 3) of 0 elements
+        # is ambiguous (any -1 satisfies "0 elements"), so derive the logical
+        # block count directly from the packed layout instead -- every 3
+        # packed bytes hold 2 logical indices (see pack_indices).
+        blocks = packed.shape[-1] * 2 // 3
+        return torch.empty(*packed.shape[:-1], blocks, dtype=torch.uint16, device=packed.device)
     x = packed.long().reshape(*packed.shape[:-1], -1, 3)
     b0, b1, b2 = x[..., 0], x[..., 1], x[..., 2]
     even = b0 + (b1 // 16) * 256
@@ -78,25 +94,18 @@ def encode(
              (dtype chosen from codebook size; see index_dtype).
     norms:   (B, H, S) fp16, per-vector L2 norms.
 
+    Compatibility adapter over codec.PreparedCodec: builds one for this call
+    (moving codebook/rotation to x.device if needed) and delegates to it.
     Nearest-codeword search is delegated to the shared chunked scorer
     (scoring.nearest) — the same implementation offline codebook construction
     uses, so the training and deployment geometry cannot drift. Peak memory
     stays ~max_score_bytes regardless of N.
     """
-    norms = x.norm(dim=-1)
-    safe = norms.clamp(min=1e-6)
-    y = x.to(torch.float32) / safe.unsqueeze(-1)
-    y = y @ rotation.to(x.device)  # (B, H, S, d)
-    y = y.view(*y.shape[:-1], -1, k)  # (B, H, S, d/k, k)
-
     n_levels = codebook.shape[0]
-    dtype = index_dtype(n_levels)
-    blocks = y.shape[-2]
-    rows = y.numel() // k  # = B * H * S * blocks
-    idx, _ = nearest(y.reshape(rows, k), codebook, max_score_bytes=max_score_bytes)
-    indices = idx.view(*y.shape[:-2], blocks).to(dtype)
-    norms_f16 = safe.to(torch.float16)
-    return indices, norms_f16
+    codec = PreparedCodec(codebook, rotation, k, n_levels)
+    if codec.codebook.device != x.device:
+        codec = codec.to(x.device)
+    return codec.encode(x, max_score_bytes=max_score_bytes)
 
 
 @torch.no_grad()
@@ -107,16 +116,16 @@ def decode(
     rotation: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize (indices, norms) back to a (B, H, S, d) tensor."""
-    if indices.numel() == 0:
-        # Empty cache (e.g. after crop(0)): reshape of 0 elements is ambiguous.
-        d = codebook.shape[1]  # blocks * k
-        return torch.empty(*indices.shape[:-1], d, dtype=dtype, device=indices.device)
-    y = codebook.to(indices.device)[indices.long()]  # (B, H, S, d/k, k)
-    y = y.reshape(*y.shape[:-2], -1)  # (B, H, S, d)
-    x = y @ rotation.to(indices.device).t()
-    x = x * norms.to(x.dtype).unsqueeze(-1)
-    return x.to(dtype)
+    """Dequantize (indices, norms) back to a (B, H, S, d) tensor.
+
+    Compatibility adapter over codec.PreparedCodec; see `encode` above.
+    """
+    n_levels = codebook.shape[0]
+    k = codebook.shape[1]
+    codec = PreparedCodec(codebook, rotation, k, n_levels)
+    if codec.codebook.device != indices.device:
+        codec = codec.to(indices.device)
+    return codec.decode(indices, norms, dtype=dtype)
 
 
 def bytes_per_token(d: int, k: int, n_levels: int) -> dict[str, float]:

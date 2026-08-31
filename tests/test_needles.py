@@ -57,6 +57,16 @@ def test_validate_markers_overlap_rejected():
         mn_validate(["whale", "humpback whale"], MN_POOLS)
 
 
+def test_validate_markers_duplicate_rejected():
+    # An exact repeat is neither an "overlap" of two distinct markers nor
+    # pool text -- it needs its own check, or a repeated marker (e.g. a
+    # copy-paste config mistake) silently slips through as if it were fine.
+    with pytest.raises(ValueError, match="duplicate"):
+        mn_validate(["rabbit", "rabbit"], MN_POOLS)
+    with pytest.raises(ValueError, match="duplicate"):
+        mn_validate(["Rabbit", "rabbit"], MN_POOLS)  # case-insensitive
+
+
 def test_validate_markers_pool_text_rejected():
     with pytest.raises(ValueError, match="filler pool"):
         mn_validate(["lantern"], MN_POOLS)
