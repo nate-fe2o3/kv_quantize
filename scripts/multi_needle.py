@@ -140,8 +140,9 @@ def build_trials(
     ("Special token: <word>.") spliced in at its sampled target position
     (rounded up to the next sentence boundary), then the query suffix. The
     content string is built from fragments, tokenized once canonically, and
-    trimmed to exactly `depth` tokens -- needles are >= NEEDLE_MIN_TAIL
-    tokens from the end, so trimming only ever cuts tail filler.
+    trimmed to exactly `depth` tokens before the query is appended -- needles
+    are >= NEEDLE_MIN_TAIL tokens from the end, so trimming only ever cuts tail
+    filler.
 
     Positions are drawn fresh per trial (the estimate at a depth is then the
     expectation over placements and filler); the returned positions are the
@@ -155,6 +156,7 @@ def build_trials(
         )
 
     needle_ids = [tokenizer.encode(" " + NEEDLE_FRAME.format(word=m), add_special_tokens=False) for m in markers]
+    question_ids = tokenizer.encode(QUESTION, add_special_tokens=False)
 
     # Prefix/suffix around the (variable-length) user content, from the
     # empty-content template. Positionally valid for any content: the user
@@ -193,7 +195,7 @@ def build_trials(
             frags.append(" " + text)
             cum += len(ids)
         content = tokenizer.encode("".join(frags), add_special_tokens=False)[:depth]
-        rows.append(prefix + content + suffix)
+        rows.append(prefix + content + question_ids + suffix)
 
     # Sanity on the first row only: the prompt must actually contain every
     # marker and the query in decoded form (else tokenization ate something).
@@ -201,12 +203,12 @@ def build_trials(
     # in-context tokenization of the first unit); all rows share the same
     # offset, so the length assert is a range check, not an equality.
     first = rows[0]
-    content_len = len(first) - len(prefix) - len(suffix)
+    content_len = len(first) - len(prefix) - len(question_ids) - len(suffix)
     assert depth - 2 <= content_len <= depth + 1, f"content length {content_len} off depth {depth}"
     dec = normalize_continuation(tokenizer.decode(first))
     for m in markers:
         assert m.lower() in dec, f"marker {m!r} missing from trial 0; check MARKERS/tokenizer"
-    assert "special token" in dec, "query text missing from trial 0"
+    assert normalize_continuation(QUESTION) in dec, "query text missing from trial 0"
 
     return torch.tensor(rows, dtype=torch.long), positions
 

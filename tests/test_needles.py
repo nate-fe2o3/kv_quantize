@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import scripts.multi_needle as multi_needle  # noqa: E402
 from scripts.key_recall import (  # noqa: E402
     ANSWER_BUDGET_SLACK as KR_SLACK,
     MARKER as KR_MARKER,
@@ -90,6 +91,42 @@ class _WordsTok:
 
     def encode(self, text, add_special_tokens=False):
         return list(range(len(text.split())))
+
+
+class _CharTok:
+    """Minimal reversible tokenizer with one special chat-template token."""
+
+    im_end = 256
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(char) for char in text]
+
+    def decode(self, ids):
+        return "".join("<|im_end|>" if int(token) == self.im_end else chr(int(token)) for token in ids)
+
+    def convert_tokens_to_ids(self, token):
+        assert token == "<|im_end|>"
+        return self.im_end
+
+    def apply_chat_template(self, messages, **_kwargs):
+        rendered = []
+        for message in messages:
+            rendered.extend(self.encode(f"<{message['role']}>{message['content']}"))
+            rendered.append(self.im_end)
+        rendered.extend(self.encode("<assistant>"))
+        return {"input_ids": rendered}
+
+
+def test_multi_needle_prompt_asks_for_markers(monkeypatch):
+    monkeypatch.setattr(multi_needle, "NEEDLE_MIN_POS", 50)
+    monkeypatch.setattr(multi_needle, "NEEDLE_MIN_TAIL", 100)
+    monkeypatch.setattr(multi_needle, "NEEDLE_SPACING", 10)
+
+    tokenizer = _CharTok()
+    rows, _ = multi_needle.build_trials(tokenizer, ["rabbit", "whale"], depth=400, trials=1, seed=0)
+    prompt = tokenizer.decode(rows[0])
+
+    assert multi_needle.QUESTION.strip() in prompt
 
 
 def test_required_answer_tokens_scales_with_marker_length():
