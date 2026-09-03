@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -50,11 +51,49 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+# --- import bootstrap ----------------------------------------------------
+# A Databricks notebook's CWD is not the repo root, so `import fibquant`
+# fails with ModuleNotFoundError when running as a notebook cell. Mirror
+# scripts/eval_cuda.py: resolve the repo root (explicit REPO_ROOT > already
+# importable fibquant > this script's location > cwd) and prepend it to
+# sys.path before any fibquant import.
+REPO_ROOT = None  # e.g. "/Workspace/Repos/me/kv_quantize" if auto-detect fails
+
+
+def _resolve_repo_root() -> Path:
+    candidates: list[Path] = []
+    if REPO_ROOT is not None:
+        candidates.append(Path(REPO_ROOT))
+    try:
+        import fibquant as _fq
+    except ImportError:
+        pass
+    else:
+        candidates.append(Path(_fq.__file__).resolve().parent.parent)
+    try:
+        candidates.append(Path(__file__).resolve().parent.parent)
+    except NameError:
+        pass  # notebook cells have no __file__
+    candidates.append(Path.cwd())
+    for cand in candidates:
+        if (cand / "fibquant").is_dir():
+            return cand.resolve()
+    raise RuntimeError(
+        "cannot locate the repo root (fibquant/) -- set REPO_ROOT at the top of "
+        "this script or run it from the repo checkout"
+    )
+
+
+_REPO_ROOT = _resolve_repo_root()
+sys.path.insert(0, str(_REPO_ROOT))
+
 from fibquant import FibQuantCache, FibQuantSpec
 from fibquant.eval_harness import load_model
 from fibquant.probes import build_spec_matrix
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s"
+)
 
 # --- paths (Databricks volume layout) ------------------------------------
 MODEL_DIR = "/Volumes/security_engineering/nbutton/q34b/models/Qwen3.5-0.8B/"
@@ -69,7 +108,9 @@ if DATASETS_CACHE_DIR:
 
 # --- run configuration ---------------------------------------------------
 LIMIT = None  # number of questions to run (smoke test only; None = all 503)
-MAX_CONTEXT = 262144  # Qwen3.5-0.8B max_position_embeddings; None = read from model config
+MAX_CONTEXT = (
+    262144  # Qwen3.5-0.8B max_position_embeddings; None = read from model config
+)
 MAX_NEW_TOKENS = 128  # official non-thinking output cap
 INCLUDE_BASELINE = True  # fp16 (no FibQuant) as the reference config
 BITS = []  # e.g. [2] -- FibQuant bits/coord pairs; [] when SPEC_PATHS is set
@@ -105,7 +146,12 @@ def normalize_item(item: dict) -> dict:
     common mirror variant that flattens choices to a list.
     """
     if all(k in item for k in ("choice_A", "choice_B", "choice_C", "choice_D")):
-        choices = [item["choice_A"], item["choice_B"], item["choice_C"], item["choice_D"]]
+        choices = [
+            item["choice_A"],
+            item["choice_B"],
+            item["choice_C"],
+            item["choice_D"],
+        ]
     else:
         choices = list(item["choices"])
     return {
@@ -144,7 +190,7 @@ def middle_truncate_ids(ids: list[int], budget: int) -> list[int]:
     if len(ids) <= budget:
         return ids
     half = budget // 2
-    return ids[:half] + ids[len(ids) - (budget - half):]
+    return ids[:half] + ids[len(ids) - (budget - half) :]
 
 
 def _chat_encode(tokenizer, text: str) -> list[int]:
@@ -171,7 +217,9 @@ def build_input_ids(
     """
     doc = item["context"]
     doc_ids = tokenizer.encode(doc, add_special_tokens=False)
-    ids = _chat_encode(tokenizer, render_prompt_text(doc, item["question"], item["choices"]))
+    ids = _chat_encode(
+        tokenizer, render_prompt_text(doc, item["question"], item["choices"])
+    )
     if len(ids) <= max_context:
         return ids, len(doc_ids), False
 
@@ -179,10 +227,14 @@ def build_input_ids(
     over = len(ids) - len(doc_ids)
     budget = max_context - over - 8  # slack for cross-boundary re-merge drift
     if budget <= 0:
-        raise ValueError(f"max_context {max_context} too small for the fixed prompt overhead {over}")
+        raise ValueError(
+            f"max_context {max_context} too small for the fixed prompt overhead {over}"
+        )
     truncated = middle_truncate_ids(doc_ids, budget)
     doc_cut = tokenizer.decode(truncated)
-    ids = _chat_encode(tokenizer, render_prompt_text(doc_cut, item["question"], item["choices"]))
+    ids = _chat_encode(
+        tokenizer, render_prompt_text(doc_cut, item["question"], item["choices"])
+    )
     if len(ids) > max_context:  # re-encoding drift: official whole-prompt cut
         ids = middle_truncate_ids(ids, max_context)
     assert len(ids) <= max_context
@@ -207,7 +259,12 @@ def summarize(rows: list[dict]) -> dict:
     rows' token stats are reported alongside, since they explain a score.
     """
     accs: dict[str, list[int]] = {
-        "overall": [], "easy": [], "hard": [], "short": [], "medium": [], "long": [],
+        "overall": [],
+        "easy": [],
+        "hard": [],
+        "short": [],
+        "medium": [],
+        "long": [],
     }
     for row in rows:
         hit = 1 if row["pred"] == row["answer"] else 0
@@ -218,7 +275,9 @@ def summarize(rows: list[dict]) -> dict:
     summary = {
         "n": len(rows),
         "n_parse_fail": sum(1 for r in rows if r["pred"] is None),
-        "mean_doc_tokens": round(sum(r["n_doc_tokens"] for r in rows) / max(len(rows), 1), 1),
+        "mean_doc_tokens": round(
+            sum(r["n_doc_tokens"] for r in rows) / max(len(rows), 1), 1
+        ),
         "n_truncated": sum(1 for r in rows if r["truncated"]),
     }
     for key, hits in accs.items():
@@ -248,8 +307,17 @@ def model_identity(model_dir: str, config_text) -> dict:
     Enough to catch "pointed the script at a different model directory or a
     materially different config" without hashing multi-GB checkpoint shards.
     """
-    fields = ("model_type", "hidden_size", "num_hidden_layers", "vocab_size", "max_position_embeddings")
-    return {"model_dir": str(model_dir), **{f: getattr(config_text, f, None) for f in fields}}
+    fields = (
+        "model_type",
+        "hidden_size",
+        "num_hidden_layers",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    return {
+        "model_dir": str(model_dir),
+        **{f: getattr(config_text, f, None) for f in fields},
+    }
 
 
 def spec_fingerprint(spec: FibQuantSpec | None) -> dict | None:
@@ -268,8 +336,12 @@ def spec_fingerprint(spec: FibQuantSpec | None) -> dict | None:
         "n_levels": spec.n_levels,
         "seed": spec.seed,
         "mse": spec.mse,
-        "codebook_sha256": hashlib.sha256(spec.codebook.detach().cpu().contiguous().numpy().tobytes()).hexdigest(),
-        "rotation_sha256": hashlib.sha256(spec.rotation.detach().cpu().contiguous().numpy().tobytes()).hexdigest(),
+        "codebook_sha256": hashlib.sha256(
+            spec.codebook.detach().cpu().contiguous().numpy().tobytes()
+        ).hexdigest(),
+        "rotation_sha256": hashlib.sha256(
+            spec.rotation.detach().cpu().contiguous().numpy().tobytes()
+        ).hexdigest(),
     }
 
 
@@ -289,7 +361,9 @@ def build_manifest(
         "version": _MANIFEST_VERSION,
         "model": model_identity,
         "spec": spec_fingerprint(spec),
-        "prompt_template_sha256": hashlib.sha256(PROMPT_0SHOT.encode("utf-8")).hexdigest(),
+        "prompt_template_sha256": hashlib.sha256(
+            PROMPT_0SHOT.encode("utf-8")
+        ).hexdigest(),
         "generation": {
             "max_context": max_context,
             "max_new_tokens": max_new_tokens,
@@ -326,7 +400,9 @@ def items_fingerprint(items: list[dict]) -> str:
         }
         for it in items
     ]
-    blob = "\n".join(json.dumps(c, sort_keys=True, ensure_ascii=False) for c in canonical)
+    blob = "\n".join(
+        json.dumps(c, sort_keys=True, ensure_ascii=False) for c in canonical
+    )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -393,7 +469,9 @@ def read_jsonl_rows(path: Path) -> tuple[list[dict], bool]:
             if i != len(lines) - 1:
                 raise
             truncated = True
-            logging.warning("discarding truncated trailing line in %s (killed mid-write)", path)
+            logging.warning(
+                "discarding truncated trailing line in %s (killed mid-write)", path
+            )
     return rows, truncated
 
 
@@ -423,7 +501,9 @@ def load_and_repair_jsonl(path: Path) -> list[dict]:
     """
     rows, truncated = read_jsonl_rows(path)
     if truncated:
-        logging.warning("repairing %s: truncating to the last complete row before continuing", path)
+        logging.warning(
+            "repairing %s: truncating to the last complete row before continuing", path
+        )
         repair_truncated_jsonl(path, rows)
     return rows
 
@@ -458,7 +538,9 @@ def run_config(
         done_ids = {row["_id"] for row in load_and_repair_jsonl(out_jsonl)}
     pending = [p for p in prompts if p["_id"] not in done_ids]
     if done_ids:
-        logging.info("resuming: %d/%d already in %s", len(done_ids), len(prompts), out_jsonl)
+        logging.info(
+            "resuming: %d/%d already in %s", len(done_ids), len(prompts), out_jsonl
+        )
 
     t0 = time.time()
     with torch.no_grad(), open(out_jsonl, "a", encoding="utf-8") as fout:
@@ -474,7 +556,9 @@ def run_config(
                 do_sample=False,
                 past_key_values=cache,
             )
-            response = tokenizer.decode(out[0, ids.shape[-1]:], skip_special_tokens=True)
+            response = tokenizer.decode(
+                out[0, ids.shape[-1] :], skip_special_tokens=True
+            )
             pred = extract_answer(response)
             row = {
                 "_id": p["_id"],
@@ -493,7 +577,9 @@ def run_config(
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
             fout.flush()
             if i % 25 == 0 or i == len(pending):
-                logging.info("  %d/%d generated (%.0fs)", i, len(pending), time.time() - t0)
+                logging.info(
+                    "  %d/%d generated (%.0fs)", i, len(pending), time.time() - t0
+                )
     # Return every row on disk (resumed + fresh) so summaries never go partial.
     # A truncated trailing line here can only be this run's own last append
     # getting killed; repairing keeps the file valid for the *next* resume.
@@ -504,7 +590,9 @@ def run_config(
 def main() -> None:
     specs = build_spec_matrix(INCLUDE_BASELINE, BITS, SPEC_PATHS)
     if not specs:
-        raise ValueError("set BITS/SPEC_PATHS or INCLUDE_BASELINE so at least one configuration runs")
+        raise ValueError(
+            "set BITS/SPEC_PATHS or INCLUDE_BASELINE so at least one configuration runs"
+        )
 
     model_dir = Path(MODEL_DIR)
     if not model_dir.exists():
@@ -529,7 +617,9 @@ def main() -> None:
     prompts: list[dict] = []
     for it in items:
         ids, n_doc, truncated = build_input_ids(tokenizer, it, max_context)
-        prompts.append({**it, "input_ids": ids, "n_doc_tokens": n_doc, "truncated": truncated})
+        prompts.append(
+            {**it, "input_ids": ids, "n_doc_tokens": n_doc, "truncated": truncated}
+        )
     logging.info(
         "prompts built: %d (%.1f%% truncated, mean %d doc tokens)",
         len(prompts),
@@ -567,9 +657,17 @@ def main() -> None:
     for key in ("overall", "easy", "hard", "short", "medium", "long"):
         row = "".join(f"{results[name][key]:10.1f}%" for name, _ in specs)
         print(f"{key:<8}{row}")
-    print("\nparse-fail " + "".join(f"{results[name]['n_parse_fail']:>12}" for name, _ in specs))
-    print("trunc " + "".join(f"{results[name]['n_truncated']:>12}" for name, _ in specs))
-    print("mean-doc-tokens " + "".join(f"{results[name]['mean_doc_tokens']:>12}" for name, _ in specs))
+    print(
+        "\nparse-fail "
+        + "".join(f"{results[name]['n_parse_fail']:>12}" for name, _ in specs)
+    )
+    print(
+        "trunc " + "".join(f"{results[name]['n_truncated']:>12}" for name, _ in specs)
+    )
+    print(
+        "mean-doc-tokens "
+        + "".join(f"{results[name]['mean_doc_tokens']:>12}" for name, _ in specs)
+    )
     print(f"\nresults: {out_root}")
 
 
