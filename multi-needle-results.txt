@@ -1,0 +1,14 @@
+version: 4c4c866f
+configs: baseline, fq-N256, fq-N4096
+trials=50 (batched 10) depths=[4096, 8192, 16384] (filler capped at 16368 tokens) markers=['rabbit', 'whale', 'sable', 'lark', 'wren'] max_new=150
+needles: buried in [1024, depth-1024], min spacing 256; success = all 5 markers appear as words in the continuation (format-agnostic regex)
+[baseline] done in 58s
+[fq-N256] done in 117s
+[fq-N4096] done in 106s
+
+depth     baseline   fq-N256  fq-N4096
+4096           34%        4%        8%
+8192           26%        4%       12%
+16368          16%        0%        6%
+
+
