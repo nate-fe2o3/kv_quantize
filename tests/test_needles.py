@@ -31,6 +31,36 @@ from scripts.multi_needle import (  # noqa: E402
 )
 
 
+def test_filler_space_covers_long_runs():
+    """The unique-sentence space must be large enough that a 65k-token
+    multi-needle depth (50 trials, ~300k-800k filler sentences, more with an
+    aggressive-merge tokenizer) can never exhaust a template family mid-run.
+    The old 14-template space (1.1M unique, families down to 2.7k combos)
+    failed at ~587k sentences with 'could not generate a unique, marker-free
+    filler sentence'.
+    """
+    import re as _re
+    from functools import reduce
+
+    from fibquant.probes import SENTENCE_POOLS, SENTENCE_TEMPLATES
+
+    slot_re = _re.compile(r"\{(\w+)\}")
+    total = 0
+    for template in SENTENCE_TEMPLATES:
+        slots = slot_re.findall(template)
+        assert len(set(slots)) == len(slots), f"template repeats a slot: {template}"
+        for slot in slots:
+            assert slot in SENTENCE_POOLS, f"slot {slot!r} missing from pools: {template}"
+        capacity = 1
+        for slot in slots:
+            capacity *= len(SENTENCE_POOLS[slot])
+        assert capacity >= 100_000, f"family too small ({capacity}): {template}"
+        total += capacity
+    assert total >= 1_000_000_000  # 7.1B today; floor keeps it far above 65k runs
+    for slot, words in SENTENCE_POOLS.items():
+        assert len(words) == len(set(words)), f"duplicate word in pool {slot}"
+
+
 def test_normalize_continuation_collapses_whitespace():
     assert kr_norm("  Blue   whale.\n") == "blue whale."
     assert mn_norm("Special token: GRAND  PIANO") == "special token: grand piano"
