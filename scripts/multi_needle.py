@@ -10,8 +10,9 @@ configs; needle layout is free):
      content-match mid-context with filler on both sides; key_recall's
      near-start placement let it take a position shortcut.
   2. Multiple needles: with N needles, success = ALL markers appear in the
-     continuation, so miss rates multiply (a 5% per-needle tax becomes ~23%
-     at 5 needles).
+     continuation (word-boundary regex match, format-agnostic -- see
+     fibquant.probes.marker_hits), so miss rates multiply (a 5% per-needle
+     tax becomes ~23% at 5 needles).
 
 Needle positions are re-sampled per trial (never fixed per depth): recall at a
 depth is then the expectation over both placements and filler — the quantity
@@ -42,6 +43,7 @@ from fibquant.eval_harness import load_model
 from fibquant.probes import (
     SENTENCE_POOLS,
     build_spec_matrix,
+    marker_hits,
     normalize_continuation,
     required_answer_tokens as _required_answer_tokens,
     unique_filler_sentence,
@@ -64,13 +66,15 @@ TRIALS = 50  # trials per depth
 TRIAL_BATCH = 4  # peak activation memory scales batch * seq^2; 4 at 16k
 DEPTHS = [4096, 8192, 16384]  # total tokens before the query (filler + needles)
 MAX_LENGTH = 16384  # cap on filler; DEPTHS entries are clamped like key_recall
-# Max generated tokens per trial. None = auto: the token cost of the verbose
-# marker listing + ANSWER_BUDGET_SLACK (see required_answer_tokens). With
-# multi-token markers a fixed small budget can cut the continuation off
-# mid-list, and a cut tail counts as forgotten markers -- a silent recall
-# underestimate.
-MAX_NEW_TOKENS = None
-ANSWER_BUDGET_SLACK = 16  # framing/prefix allowance beyond the marker list
+# Max generated tokens per trial. Generous fixed allowance: the bare marker
+# list costs ~11 tokens (5 words + commas), so 150 leaves room for any
+# phrasing without ever cutting off a model that is still answering. The cap
+# almost never binds in wall time: eos_token_id=<|im_end|> (the chat stop
+# token) is passed to generate, so decoding stops as soon as the model is
+# done answering; budget is headroom, not cost.
+MAX_NEW_TOKENS = 150
+ANSWER_BUDGET_SLACK = 16  # floor sanity check only (see main()): the verbose
+# marker listing + slack must fit inside MAX_NEW_TOKENS or the run errors out
 MARKERS = ["rabbit", "whale", "sable", "lark", "wren"]  # one marker per needle (len(MARKERS) needles);
 # Markers may be multi-token words or short phrases: they are spliced in as
 # " " + frame and matched against the whitespace-normalized continuation.
@@ -227,6 +231,10 @@ def run_config(
 
     Returns (all-recall per depth, per-marker recall per depth), so a partial
     failure (2 of 3 markers reproduced) is visible in the diagnostics.
+    Continuations are scored with word-boundary regex (fibquant.probes.marker_hits)
+    on the whitespace-normalized text: a marker counts as retrieved however
+    the model chooses to phrase it (bare list, prose, case/punctuation
+    variants), and substring false positives ("wren" in "wrenches") do not.
     """
     all_recall: dict[int, float] = {}
     per_marker: dict[str, dict[int, float]] = {m: {} for m in markers}
@@ -244,11 +252,12 @@ def run_config(
                     attention_mask=torch.ones_like(chunk),
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
+                    eos_token_id=tokenizer.eos_token_id,
                     past_key_values=cache,
                 )
                 conts = [normalize_continuation(tokenizer.decode(row[chunk.shape[-1]:])) for row in out]
                 for c in conts:
-                    got = [m.lower() in c for m in markers]
+                    got = marker_hits(c, markers)
                     if all(got):
                         hits_all += 1
                     for m, g in zip(markers, got):
@@ -293,7 +302,8 @@ def main() -> None:
     )
     print(
         f"needles: buried in [{NEEDLE_MIN_POS}, depth-{NEEDLE_MIN_TAIL}], "
-        f"min spacing {NEEDLE_SPACING}; success = all {len(MARKERS)} markers in the continuation"
+        f"min spacing {NEEDLE_SPACING}; success = all {len(MARKERS)} markers appear "
+        "as words in the continuation (format-agnostic regex)"
     )
 
     inputs_by_depth: dict[int, torch.Tensor] = {}

@@ -1,0 +1,37 @@
+{
+ "k": 5,
+ "trials": 25,
+ "per_marker_union": {
+  "baseline": {
+   "rabbit": 0.8,
+   "whale": 0.76,
+   "sable": 0.8,
+   "lark": 0.88,
+   "wren": 0.68
+  },
+  "fq-N256": {
+   "rabbit": 0.88,
+   "whale": 0.24,
+   "sable": 0.44,
+   "lark": 0.68,
+   "wren": 0.4
+  },
+  "fq-N4096": {
+   "rabbit": 0.92,
+   "whale": 0.84,
+   "sable": 0.72,
+   "lark": 0.76,
+   "wren": 0.6
+  }
+ },
+ "all5_union": {
+  "baseline": 0.52,
+  "fq-N256": 0.04,
+  "fq-N4096": 0.52
+ },
+ "mean_markers": {
+  "baseline": 3.92,
+  "fq-N256": 2.64,
+  "fq-N4096": 3.84
+ }
+}

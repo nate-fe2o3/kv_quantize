@@ -1,0 +1,7 @@
+Loading weights:   0%|          | 0/473 [00:00<?, ?it/s]Loading weights: 100%|██████████| 473/473 [00:00<00:00, 7525.86it/s]
+ask_question=True trials=50 max_new=43
+trial0 tail: ' the bridge at first light. A mole nestled slowly near the rooftop. The cartographer carried a crate across the harbor. A mirror hung slowly over the harbor. A oarsman vanished through the courtyard at List all five special tokens, separated by commas.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+[baseline] recall=58%  (29/50) in 118s
+[fq-N256] recall=40%  (20/50) in 152s
+[fq-N4096] recall=50%  (25/50) in 294s
+wrote local_mn_enum50.json

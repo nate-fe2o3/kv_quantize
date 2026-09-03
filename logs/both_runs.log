@@ -1,0 +1,14 @@
+ask_question=False trials=50 max_new=43
+trial0 tail: ' beside a hatbox. A beekeeper dashed through the bridge at first light. A mole nestled slowly near the rooftop. The cartographer carried a crate across the harbor. A mirror hung slowly over the harbor. A oarsman vanished through the courtyard at<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+[baseline] recall=0%  (0/50) in 108s
+[fq-N256] recall=0%  (0/50) in 145s
+[fq-N4096] recall=0%  (0/50) in 260s
+wrote local_mn_bug50.json
+=== FIXED ===
+ask_question=True trials=50 max_new=43
+trial0 tail: ' dashed through the bridge at first light. A mole nestled slowly near the rooftop. The cartographer carried a crate across the harbor. A mirror hung slowly over the harbor. A oarsman vanished through the courtyard at What were the special tokens? Answer:<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+[baseline] recall=14%  (7/50) in 108s
+[fq-N256] recall=0%  (0/50) in 137s
+[fq-N4096] recall=26%  (13/50) in 297s
+wrote local_mn_fixed50.json
+DONE_ALL

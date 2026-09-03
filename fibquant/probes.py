@@ -150,6 +150,35 @@ def required_answer_tokens(
     return len(tokenizer.encode(verbose, add_special_tokens=False)) + slack
 
 
+def minimal_answer_tokens(tokenizer, markers: Sequence[str]) -> int:
+    """Smallest continuation that still contains every marker: the bare comma list.
+
+    Sizes the generation budget (see multi_needle.py's answer-allowance
+    constant): any response with every marker needs at least this many tokens,
+    however terse; the budget is a generous multiple of it so the cap never
+    cuts off a model that is still answering.
+    """
+    return len(tokenizer.encode(", ".join(markers), add_special_tokens=False))
+
+
+def marker_hits(text: str, markers: Sequence[str]) -> list[bool]:
+    """Word-boundary marker hits in one continuation (format-agnostic).
+
+    The old check (substring of the whitespace-normalized continuation)
+    probed response *format* as much as recall: "wren" inside "wrenches"
+    counted as a hit, while any phrasing the strict form didn't anticipate
+    (answers framed as prose, or with commas/case/punctuation variations)
+    could score a miss even when the marker was recalled. This is an
+    existence check: a marker counts as retrieved when it appears as a word
+    (or, for multi-token markers, the phrase with whitespace collapsed to
+    single spaces) anywhere in the continuation, in any case/format.
+    Multi-token markers glued into one token ("bluewhale") still miss -- keep
+    markers to words/short phrases (see validate_markers).
+    """
+    text = normalize_continuation(text)
+    return [bool(re.search(rf"(?<!\w){re.escape(m.lower())}(?!\w)", text)) for m in markers]
+
+
 def unique_filler_sentence(
     tokenizer,
     rng: random.Random,

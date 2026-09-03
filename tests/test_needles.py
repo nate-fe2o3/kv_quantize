@@ -145,5 +145,32 @@ def test_required_answer_tokens_scales_with_marker_length():
     assert kr_required(tok, ["blue whale"]) == len(" Special token: blue whale.".split()) + KR_SLACK
 
 
+def test_marker_hits_is_word_boundary_and_format_agnostic():
+    from fibquant.probes import marker_hits
+
+    markers = ["rabbit", "whale", "sable", "lark", "wren"]
+    # Exact words hit regardless of case/punctuation/whitespace.
+    assert marker_hits("Lark, whale, and SABLE rabbit wren.", markers) == [True] * 5
+    # Substrings do NOT count: "wren" inside "wrenches", "sable" in "sablefish".
+    assert marker_hits("the wrenches are in the sablefish", markers) == [False] * 5
+    # Multi-token markers match with whitespace collapsed, glued stays a miss.
+    assert marker_hits("blue   whale", ["blue whale"]) == [True]
+    assert marker_hits("bluewhale", ["blue whale"]) == [False]
+    # Empty continuation: no hits.
+    assert marker_hits("", markers) == [False] * 5
+
+
+def test_marker_hits_aligns_with_substring_for_core_cases():
+    from fibquant.probes import marker_hits
+
+    # For plain single words, regex and substring agree on the normal cases;
+    # regex is stricter about letters continuing ("rabbithole" is NOT a hit),
+    # while hyphen/apostrophe compounds ARE hits -- the marker is emitted as a
+    # component word, and the tokenizer would split it anyway.
+    assert marker_hits("the answer is rabbit", ["rabbit"]) == [True]
+    assert marker_hits("the answer is rabbithole", ["rabbit"]) == [False]
+    assert marker_hits("the answer is rabbit-hole", ["rabbit"]) == [True]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

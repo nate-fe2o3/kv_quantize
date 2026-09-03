@@ -1,0 +1,5 @@
+Loading weights:   0%|          | 0/473 [00:00<?, ?it/s]Loading weights: 100%|██████████| 473/473 [00:00<00:00, 9167.01it/s]
+[baseline] all5(union)=52% mean_markers=3.92/5 per-marker={rabbit:20, whale:19, sable:20, lark:22, wren:17} in 307s
+[fq-N256] all5(union)=4% mean_markers=2.64/5 per-marker={rabbit:22, whale:6, sable:11, lark:17, wren:10} in 427s
+[fq-N4096] all5(union)=52% mean_markers=3.84/5 per-marker={rabbit:23, whale:21, sable:18, lark:19, wren:15} in 903s
+wrote local_mn_union.json

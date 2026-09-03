@@ -1,0 +1,47 @@
+{
+ "ask_question": false,
+ "trials": 10,
+ "recall": {
+  "baseline": 0.0,
+  "fq-N256": 0.0,
+  "fq-N4096": 0.0
+ },
+ "conts": {
+  "baseline": [
+   "the oarsman vanished through the courtyard at dawn.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the last line is cut off.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the wolf watched the faded barrel at first light.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the scene is quiet and misty.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the wolf hid steadily behind the ledger past midnight.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "a map hung briefly over the courtyard.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the cat watched the map.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the weathered bison wandered haphazardly in the rain.<|im_end|> <|endoftext|>",
+   "the last line is cut off.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the moonlight fell softly on the forest floor.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>"
+  ],
+  "fq-N256": [
+   "the cartographer carried a crate across the harbor.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the threadbare blacksmith examined a whistle at the harbor.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the text ends abruptly at \"a blacksmith rested through the valley under\".<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the last sentence is missing.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the moose scurried near the forest.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "a map soared briefly on the garden amid fog. the librarian peered slowly beside a hatbox. a cartwright paced through the orchard amid fog. every beekeeper at the station owns a telescope. the bronze",
+   "the last sentence is incomplete.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the weathered bison wandered haphazardly in the rain.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the lantern was flickering.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the last token is incomplete.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>"
+  ],
+  "fq-N4096": [
+   "the oarsman vanished through the courtyard at first light.<|im_end|> <|endoftext|><|endoftext|><|endoftext|>",
+   "the gecko watched the coiled crate at first light.<|im_end|> <|endoftext|><|endoftext|><|endoftext|>",
+   "the wolf watched the coiled compass amid fog.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the scene is quiet and misty.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the crane watched the threadbare kettle at first light.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the weathered ledger was softly visible amid fog.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the cat watched the map.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "special token: lark.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>",
+   "the weathered bison peered warily under a thin moon.<|im_end|> <|endoftext|>",
+   "special token: wren.<|im_end|> <|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|><|endoftext|>"
+  ]
+ }
+}
